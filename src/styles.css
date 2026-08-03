@@ -282,6 +282,8 @@ code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; fo
 .section-heading h2,
 .config-toolbar h2 { font-weight: 500; }
 .template-row { min-height: 82px; padding: 10px 14px; }
+.template-version-tag { margin-left: 10px; font-size: 0.82em; opacity: 0.75; }
+.template-update-badge { display: inline-block; margin-left: 6px; padding: 1px 6px; font-size: 0.78em; border-radius: 4px; background: var(--accent, #3b82f6); color: #fff; opacity: 0.9; vertical-align: middle; }
 .process-panel { border-radius: 8px; }
 
 @media (max-width: 1220px) {

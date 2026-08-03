@@ -19,6 +19,7 @@ import type {
   SystemInfo,
   StorageStatus,
   TemplateInfo,
+  TemplateUpdateCheck,
 } from "./types";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -157,6 +158,28 @@ export const desktopApi = {
     if (isTauri()) return invoke("list_templates");
     await wait(260);
     return templates;
+  },
+
+  async checkTemplateUpdate(): Promise<TemplateUpdateCheck> {
+    if (isTauri()) return invoke("check_template_update");
+    await wait(200);
+    return { currentVersion: "v1.0.0", latestVersion: "v1.0.0", hasUpdate: false };
+  },
+
+  async updateTemplates(): Promise<TemplateInfo[]> {
+    if (isTauri()) return invoke("update_templates");
+    await wait(500);
+    return templates;
+  },
+
+  async getTemplateUrl(): Promise<string> {
+    if (isTauri()) return invoke("get_template_url");
+    return localStorage.getItem("agentseek-template-url") || "";
+  },
+
+  async saveTemplateUrl(url: string): Promise<void> {
+    if (isTauri()) return invoke("save_template_url", { url });
+    localStorage.setItem("agentseek-template-url", url);
   },
 
   async listInstances(): Promise<InstanceRecord[]> {

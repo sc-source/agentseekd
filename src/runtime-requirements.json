@@ -13,6 +13,7 @@
     "uvInstallerWindows": "https://astral.sh/uv/install.ps1",
     "nvmInstallerTemplate": "https://raw.githubusercontent.com/nvm-sh/nvm/v{version}/install.sh",
     "nodeDistribution": "https://nodejs.org/dist",
-    "agentseekPackageMetadata": "https://pypi.org/pypi/agentseek/json"
+    "agentseekPackageMetadata": "https://pypi.org/pypi/agentseek/json",
+    "templateRepoUrl": "https://github.com/agentseek-ai/agentseek-templates"
   }
 }

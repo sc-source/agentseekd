@@ -261,6 +261,20 @@ const zh = {
   noEnvFiles: "该目录中没有 .env 文件",
   confirmExport: "导出 .env",
   exportCompleted: "已导出",
+  templateVersion: "模版版本",
+  templateUpdateAvailable: "模版有新版本",
+  templateUpdateTitle: "模版更新",
+  templateUpdateMessage: "发现模版新版本，是否更新？",
+  templateUpdating: "正在更新模版…",
+  templateUpdateSuccess: "模版更新成功",
+  templateUpdateFailed: "模版更新失败",
+  confirmUpdate: "确认更新",
+  templateUrl: "模版地址",
+  editTemplateUrl: "修改模版地址",
+  templateUrlHint: "支持 GitHub 仓库树路径或归档文件地址",
+  templateUrlExample: "示例",
+  templateUrlSaved: "模版地址已保存",
+  templateUrlInvalid: "模版地址格式无效",
 };
 
 export type TranslationKey = keyof typeof zh;
@@ -313,6 +327,13 @@ const en: Record<TranslationKey, string> = {
   uvInstallScope: "Install or upgrade in the current user's tool directory and configure the terminal PATH.", nodeInstallScope: "Install in the private AgentSeek Desktop runtime without removing or replacing system versions.", cliInstallScope: "Install or upgrade through uv and configure the terminal PATH.",
   pendingInstall: "Pending", installingDependency: "Installing", installFailed: "Failed", portsAdjusted: "conflicting ports reassigned",
   exportEnv: "Export ENV", exportEnvHint: "Scan all .env files in the project directory, choose the variable-list source, and fill matching vault values into the target file.", configDirectory: "Project directory", projectAddress: "Project address", envAddress: ".env address", sourceEnvFile: "Source .env file", targetEnvFile: "Target .env file", scanningEnvFiles: "Scanning .env files…", noEnvFiles: "No .env files found in this directory", confirmExport: "Export .env", exportCompleted: "Exported",
+  templateVersion: "Template version", templateUpdateAvailable: "Template update available",
+  templateUpdateTitle: "Template Update", templateUpdateMessage: "A new template version is available. Do you want to update?",
+  templateUpdating: "Updating templates…", templateUpdateSuccess: "Templates updated successfully", templateUpdateFailed: "Template update failed",
+  confirmUpdate: "Update",
+  templateUrl: "Template URL", editTemplateUrl: "Edit Template URL",
+  templateUrlHint: "Supports GitHub repository tree path or archive URL",
+  templateUrlExample: "Example", templateUrlSaved: "Template URL saved", templateUrlInvalid: "Invalid template URL format",
 };
 
 export const translations = { zh, en };

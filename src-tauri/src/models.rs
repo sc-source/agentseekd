@@ -45,6 +45,7 @@ pub(crate) struct RuntimeSources {
     pub(crate) nvm_installer_template: String,
     pub(crate) node_distribution: String,
     pub(crate) agentseek_package_metadata: String,
+    pub(crate) template_repo_url: String,
 }
 
 /// Load runtime requirements from the bundled JSON manifest or an override file.
@@ -158,6 +159,14 @@ pub(crate) struct TemplateInfo {
     pub(crate) framework: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TemplateUpdateCheck {
+    pub(crate) current_version: String,
+    pub(crate) latest_version: String,
+    pub(crate) has_update: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InstanceRecord {
@@ -255,6 +264,8 @@ pub(crate) struct StorageConfig {
     pub(crate) runtime_log_retention_days: u32,
     #[serde(default)]
     pub(crate) setup_completed: bool,
+    #[serde(default)]
+    pub(crate) template_url: String,
 }
 
 pub(crate) fn default_database_port() -> u16 {
@@ -290,6 +301,7 @@ impl Default for StorageConfig {
             password: String::new(),
             runtime_log_retention_days: default_runtime_log_retention_days(),
             setup_completed: false,
+            template_url: String::new(),
         }
     }
 }

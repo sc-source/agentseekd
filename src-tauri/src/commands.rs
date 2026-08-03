@@ -162,8 +162,14 @@ async fn execute_runtime_install(
 async fn list_templates(state: State<'_, DesktopState>) -> Result<Vec<TemplateInfo>, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // Refresh template cache from GitHub before listing.
-        refresh_template_cache();
+        // Ensure the template cache exists (first-run clone only).
+        let template_url = state
+            .storage_config
+            .lock()
+            .map_err(|_| "Storage config lock is poisoned".to_string())?
+            .template_url
+            .clone();
+        ensure_template_cache(&template_url);
         let result = run_cli(&["create", "--list-templates"], None)?;
         if result.code != 0 {
             return Err(result.output);
@@ -189,6 +195,94 @@ async fn list_templates(state: State<'_, DesktopState>) -> Result<Vec<TemplateIn
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn check_template_update(state: State<'_, DesktopState>) -> Result<TemplateUpdateCheck, String> {
+    let no_check = TemplateUpdateCheck {
+        current_version: String::new(),
+        latest_version: String::new(),
+        has_update: false,
+    };
+    let template_url = state
+        .storage_config
+        .lock()
+        .map_err(|_| "Storage config lock is poisoned".to_string())?
+        .template_url
+        .clone();
+    let url = resolve_template_url(&template_url);
+    // Archive sources pin the version in the URL itself; there is nothing to check.
+    let Ok(source) = parse_template_source_url(&url) else {
+        return Ok(no_check);
+    };
+    let Some(api_url) = source.releases_api_url() else {
+        return Ok(no_check);
+    };
+    let current = current_template_version().unwrap_or_default();
+    let latest = latest_template_release_tag(&api_url).unwrap_or_default();
+    let has_update = !latest.is_empty() && !current.is_empty() && current != latest;
+    Ok(TemplateUpdateCheck {
+        current_version: current,
+        latest_version: latest,
+        has_update,
+    })
+}
+
+#[tauri::command]
+async fn update_templates(state: State<'_, DesktopState>) -> Result<Vec<TemplateInfo>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let template_url = state
+            .storage_config
+            .lock()
+            .map_err(|_| "Storage config lock is poisoned".to_string())?
+            .template_url
+            .clone();
+        update_template_cache(&template_url)?;
+        let result = run_cli(&["create", "--list-templates"], None)?;
+        if result.code != 0 {
+            return Err(result.output);
+        }
+        let templates = parse_templates(&result.output);
+        state.log(
+            None,
+            "AgentSeek Desktop",
+            "lifecycle",
+            "info",
+            format!(
+                "Templates updated to {}, {} templates loaded",
+                current_template_version().unwrap_or_default(),
+                templates.len()
+            ),
+            None,
+        );
+        Ok(templates)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn get_template_url(state: State<'_, DesktopState>) -> Result<String, String> {
+    let config = state
+        .storage_config
+        .lock()
+        .map_err(|_| "Storage config lock is poisoned".to_string())?;
+    Ok(config.template_url.clone())
+}
+
+#[tauri::command]
+fn save_template_url(state: State<'_, DesktopState>, url: String) -> Result<(), String> {
+    state.ensure_storage_configurable()?;
+    let url = url.trim().to_string();
+    // Validate URL format
+    parse_template_source_url(&url)?;
+    let mut config = state
+        .storage_config
+        .lock()
+        .map_err(|_| "Storage config lock is poisoned".to_string())?;
+    config.template_url = url;
+    write_storage_config(&state.config_path, &config)
 }
 
 #[tauri::command]

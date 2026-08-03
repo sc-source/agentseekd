@@ -151,6 +151,12 @@ export interface CliStatus {
   installCommand: string;
 }
 
+export interface TemplateUpdateCheck {
+  currentVersion: string;
+  latestVersion: string;
+  hasUpdate: boolean;
+}
+
 export interface RuntimeInstallPlan {
   taskId: string;
   script: string;

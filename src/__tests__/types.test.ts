@@ -14,6 +14,7 @@ import type {
   SystemInfo,
   StorageStatus,
   CliStatus,
+  TemplateUpdateCheck,
   RuntimeInstallPlan,
   RuntimeInstallProgress,
   ServiceEndpoint,
@@ -242,6 +243,17 @@ describe("type serialization shapes", () => {
     };
     expect(obj.platform).toBe("macos");
     expect(obj.prerequisitesReady).toBe(true);
+  });
+
+  it("TemplateUpdateCheck has all fields", () => {
+    const obj: TemplateUpdateCheck = {
+      currentVersion: "v1.0.0",
+      latestVersion: "v1.1.0",
+      hasUpdate: true,
+    };
+    expect(obj.hasUpdate).toBe(true);
+    expect(obj.currentVersion).toBe("v1.0.0");
+    expect(obj.latestVersion).toBe("v1.1.0");
   });
 
   it("RuntimeInstallPlan has all fields", () => {

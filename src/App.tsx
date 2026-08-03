@@ -24,6 +24,7 @@ import {
   Maximize2,
   Moon,
   Orbit,
+  Pencil,
   Plus,
   RefreshCw,
   RotateCw,
@@ -52,6 +53,7 @@ import type {
   SystemInfo,
   StorageStatus,
   TemplateInfo,
+  TemplateUpdateCheck,
 } from "./types";
 
 type Theme = "light" | "dark";
@@ -238,11 +240,16 @@ export default function App() {
   const [logGroupCount, setLogGroupCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [refreshingTemplates, setRefreshingTemplates] = useState(false);
+  const [templateUpdateInfo, setTemplateUpdateInfo] = useState<TemplateUpdateCheck | null>(null);
+  const [templateUpdating, setTemplateUpdating] = useState(false);
+  const [templateVersionDisplay, setTemplateVersionDisplay] = useState<TemplateUpdateCheck | null>(null);
+  const [templateUrlEditOpen, setTemplateUrlEditOpen] = useState(false);
+  const [templateUrlInput, setTemplateUrlInput] = useState("");
+  const [templateUrlSaving, setTemplateUrlSaving] = useState(false);
   const [search, setSearch] = useState("");
   const [toast, setToast] = useState("");
   const [installState, setInstallState] = useState<InstallState | null>(null);
   const [installModalVisible, setInstallModalVisible] = useState(true);
-  const [installMinimized, setInstallMinimized] = useState(false);
   const [installDrag, setInstallDrag] = useState({ x: 0, y: 0 });
   const [installDragging, setInstallDragging] = useState(false);
   const installDragRef = useRef({ startX: 0, startY: 0, offsetX: 0, offsetY: 0 });
@@ -378,6 +385,62 @@ export default function App() {
       setRefreshingTemplates(false);
     }
   }, [notify]);
+
+  const checkAndPromptTemplateUpdate = useCallback(async () => {
+    setRefreshingTemplates(true);
+    try {
+      const [updateInfo, nextTemplates] = await Promise.all([
+        desktopApi.checkTemplateUpdate(),
+        desktopApi.listTemplates(),
+      ]);
+      setTemplates(nextTemplates);
+      setTemplateVersionDisplay(updateInfo);
+      if (updateInfo.hasUpdate) {
+        setTemplateUpdateInfo(updateInfo);
+      }
+    } catch (error) {
+      notify(errorMessage(error));
+    } finally {
+      setRefreshingTemplates(false);
+    }
+  }, [notify]);
+
+  const confirmTemplateUpdate = useCallback(async () => {
+    setTemplateUpdating(true);
+    setTemplateUpdateInfo(null);
+    try {
+      const nextTemplates = await desktopApi.updateTemplates();
+      setTemplates(nextTemplates);
+      const updateInfo = await desktopApi.checkTemplateUpdate();
+      setTemplateVersionDisplay(updateInfo);
+      notify(tr("templateUpdateSuccess"));
+    } catch (error) {
+      notify(tr("templateUpdateFailed") + ": " + errorMessage(error));
+    } finally {
+      setTemplateUpdating(false);
+    }
+  }, [notify, tr]);
+
+  const openTemplateUrlEdit = useCallback(async () => {
+    const currentUrl = await desktopApi.getTemplateUrl();
+    setTemplateUrlInput(currentUrl);
+    setTemplateUrlEditOpen(true);
+  }, []);
+
+  const saveTemplateUrl = useCallback(async () => {
+    setTemplateUrlSaving(true);
+    try {
+      await desktopApi.saveTemplateUrl(templateUrlInput);
+      setTemplateUrlEditOpen(false);
+      notify(tr("templateUrlSaved"));
+      // Refresh templates with new URL
+      await refreshTemplates();
+    } catch (error) {
+      notify(tr("templateUrlInvalid") + ": " + errorMessage(error));
+    } finally {
+      setTemplateUrlSaving(false);
+    }
+  }, [templateUrlInput, notify, tr, refreshTemplates]);
 
   useEffect(() => {
     if (initializedRef.current) return;
@@ -792,7 +855,6 @@ export default function App() {
     }
     setInstallModalVisible(true);
     setInstallState({ ...installState, step: "deploying", deploymentStage: "create", error: "" });
-    setInstallMinimized(false);
     try {
       const prepared = await desktopApi.prepareInstance(installState.form);
       setInstallState({ ...installState, step: "env", instance: prepared.instance, entries: prepared.env, generated: null, warning: prepared.dockerWarning || "", deploymentStage: "tasks", error: "" });
@@ -1300,7 +1362,7 @@ export default function App() {
               <label className="search-box"><Search /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={page === "templates" ? tr("searchTemplates") : tr("search")} /></label>
               <div className="command-actions">
                 {cliStatus?.cliUpdateAvailable && <div className="cli-update-notice"><span><strong>{tr("cliUpdateAvailable")}</strong><small>{cliStatus.cliVersion} → v{cliStatus.cliLatestVersion}</small></span><button className="button" type="button" onClick={() => void openRuntimeInstallConfirm(true)} disabled={cliInstalling || installPlanLoading}>{cliUpgradeRequested && (cliInstalling || installPlanLoading) ? <LoaderCircle className="spin" /> : <SquareTerminal />}{cliInstalling && cliUpgradeRequested ? tr("upgradingCli") : tr("upgradeCli")}</button></div>}
-                {page === "templates" && <button className="button secondary" type="button" onClick={() => void refreshTemplates(true)} disabled={refreshingTemplates}><RefreshCw className={refreshingTemplates ? "spin" : ""} />{tr("refresh")}</button>}
+                {page === "templates" && <><button className="button secondary" type="button" onClick={() => void checkAndPromptTemplateUpdate()} disabled={refreshingTemplates || templateUpdating}><RefreshCw className={(refreshingTemplates || templateUpdating) ? "spin" : ""} />{templateUpdating ? tr("templateUpdating") : tr("refresh")}</button><button className="icon-button" type="button" onClick={() => void openTemplateUrlEdit()} title={tr("editTemplateUrl")} aria-label={tr("editTemplateUrl")}><Pencil /></button></>}
               </div>
             </div>
           )}
@@ -1332,7 +1394,7 @@ export default function App() {
           {page === "templates" && (
             <div className="template-layout">
               <div className="template-list surface">
-                <div className="section-heading"><div><h2>{tr("templates")}</h2><p><SquareTerminal />agentseek create --list-templates</p></div><span className="count-label">{filteredTemplates.length}</span></div>
+                <div className="section-heading"><div><h2>{tr("templates")}</h2><p><SquareTerminal />agentseek create --list-templates{templateVersionDisplay?.currentVersion && <span className="template-version-tag">{tr("templateVersion")}: {templateVersionDisplay.currentVersion}{templateVersionDisplay.hasUpdate && <span className="template-update-badge">{tr("templateUpdateAvailable")}</span>}</span>}</p></div><span className="count-label">{filteredTemplates.length}</span></div>
                 {filteredTemplates.map((template) => (
                   <div className="template-row" key={template.id}>
                     <div className={`framework-mark ${template.framework}`}>{template.framework.slice(0, 2).toUpperCase()}</div>
@@ -1423,7 +1485,7 @@ export default function App() {
       {installState && installModalVisible && (
         <div className="modal-backdrop">
           <div className={`modal install-modal ${installState.step === "env" ? "wide" : ""}`} role="dialog" aria-modal="true">
-            <div className="modal-head"><div><span className="eyebrow">{installState.template.id}</span><h2>{installState.step === "env" ? tr("envTitle") : tr("createInstance")}</h2></div><button className="icon-button" onClick={() => { if (installState.step === "deploying") { setInstallMinimized(true); setInstallModalVisible(false); } else if (installState.step !== "env" || installState.generated) { setInstallState(null); } }} disabled={installState.step === "env" && !installState.generated} aria-label={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} title={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} type="button"><X /></button></div>
+            <div className="modal-head"><div><span className="eyebrow">{installState.template.id}</span><h2>{installState.step === "env" ? tr("envTitle") : tr("createInstance")}</h2></div><button className="icon-button" onClick={() => { if (installState.step === "deploying") { setInstallModalVisible(false); } else if (installState.step !== "env" || installState.generated) { setInstallState(null); } }} disabled={installState.step === "env" && !installState.generated} aria-label={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} title={installState.step === "deploying" ? tr("hideTask") : installState.step === "env" && !installState.generated ? tr("configureEnvFirst") : tr("close")} type="button"><X /></button></div>
             {installState.step === "form" && <div className="modal-body form-grid">
               <label><span>{tr("instanceName")}</span><input autoFocus value={installState.form.name} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, name: event.target.value }, error: "" })} placeholder="rag-development" /></label>
               <label className="full"><span>{tr("targetDir")}</span><div className="path-picker"><input value={installState.form.targetDir} onChange={(event) => setInstallState({ ...installState, form: { ...installState.form, targetDir: event.target.value }, error: "" })} placeholder="/Users/name/AgentSeek/instances" /><button type="button" onClick={async () => { const path = await desktopApi.chooseDirectory(); if (path) setInstallState({ ...installState, form: { ...installState.form, targetDir: path }, error: "" }); }}><FolderOpen />{tr("choose")}</button></div>{installState.form.targetDir.trim() && installState.form.name.trim() && <code className="target-path-preview">{`${installState.form.targetDir.replace(/[\\/]+$/, "")}/${installState.form.name.trim()}`}</code>}</label>
@@ -1575,6 +1637,21 @@ export default function App() {
         </div>
       )}
 
+      {templateUpdateInfo && (
+        <div className="modal-backdrop">
+          <div className="modal" role="alertdialog" aria-modal="true">
+            <div className="modal-head"><div><span className="eyebrow">{tr("templateUpdateTitle")}</span><h2>{tr("templateUpdateTitle")}</h2><p>{tr("templateUpdateMessage")}</p></div><button className="icon-button" onClick={() => setTemplateUpdateInfo(null)} type="button"><X /></button></div>
+            <div className="modal-body" style={{ padding: "16px" }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div><strong>{tr("currentVersion")}:</strong> {templateUpdateInfo.currentVersion}</div>
+                <div><strong>{tr("latestVersion")}:</strong> {templateUpdateInfo.latestVersion}</div>
+              </div>
+            </div>
+            <div className="modal-foot"><button className="button secondary" onClick={() => setTemplateUpdateInfo(null)} type="button">{tr("cancel")}</button><button className="button primary" onClick={() => void confirmTemplateUpdate()} type="button"><RefreshCw />{tr("confirmUpdate")}</button></div>
+          </div>
+        </div>
+      )}
+
       {commentTooltip && <div
         className={`comment-popover ${commentTooltip.placement}`}
         role="dialog"
@@ -1599,6 +1676,32 @@ export default function App() {
         spellCheck={false}
         aria-label={tr("comment")}
       /></div>}
+
+      {templateUrlEditOpen && (
+        <div className="modal-backdrop">
+          <div className="modal" role="dialog" aria-modal="true">
+            <div className="modal-head"><div><h2>{tr("editTemplateUrl")}</h2><p>{tr("templateUrlHint")}</p></div><button className="icon-button" onClick={() => setTemplateUrlEditOpen(false)} type="button"><X /></button></div>
+            <div className="modal-body" style={{ padding: "16px" }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <span>{tr("templateUrl")}</span>
+                <input
+                  type="text"
+                  value={templateUrlInput}
+                  onChange={(event) => setTemplateUrlInput(event.target.value)}
+                  placeholder="https://github.com/org/repo/tree/main/templates"
+                  autoFocus
+                />
+              </label>
+              <div style={{ marginTop: "12px", fontSize: "0.85em", opacity: 0.7 }}>
+                <div>{tr("templateUrlExample")}:</div>
+                <code style={{ display: "block", marginTop: "4px", wordBreak: "break-all" }}>https://github.com/agentseek-ai/agentseek-templates/tree/main/templates</code>
+                <code style={{ display: "block", marginTop: "4px", wordBreak: "break-all" }}>https://github.com/agentseek-ai/agentseek-templates/archive/refs/tags/v0.1.0.tar.gz</code>
+              </div>
+            </div>
+            <div className="modal-foot"><button className="button secondary" onClick={() => setTemplateUrlEditOpen(false)} type="button">{tr("cancel")}</button><button className="button primary" onClick={() => void saveTemplateUrl()} disabled={templateUrlSaving || !templateUrlInput.trim()} type="button">{templateUrlSaving ? <LoaderCircle className="spin" /> : <Check />}{tr("saveVault")}</button></div>
+          </div>
+        </div>
+      )}
 
       {toast && <div className={`toast ${installState && !installModalVisible ? "task-visible" : ""}`}><Check />{toast}</div>}
     </div>

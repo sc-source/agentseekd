@@ -648,30 +648,471 @@ fn parse_templates(output: &str) -> Vec<TemplateInfo> {
     templates
 }
 
-/// Refresh the cookiecutter template cache from GitHub.
-/// Fetches the latest remote commit and resets the working tree so that
-/// `agentseek create --list-templates` reports up-to-date templates.
-fn refresh_template_cache() {
-    let Some(home) = env::var_os("HOME") else {
-        return;
-    };
-    let cache_dir = Path::new(&home).join(".cookiecutters").join("agentseek");
-    if !cache_dir.is_dir() {
-        return;
+/// Return the template cache directory path.
+fn template_cache_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| Path::new(&home).join(".cookiecutters").join("agentseek"))
+}
+
+/// Parsed template source from a URL.
+#[derive(Debug, PartialEq)]
+enum TemplateSource {
+    /// Git tree URL: https://github.com/org/repo/tree/branch/path
+    Tree {
+        repo_url: String,
+        branch: String,
+        sub_path: String,
+    },
+    /// Archive URL: https://github.com/org/repo/archive/refs/tags/v1.0.0.tar.gz
+    Archive {
+        url: String,
+        strip_prefix: String,
+    },
+    /// Plain git repository URL (clone entire repo)
+    Repo { repo_url: String },
+}
+
+impl TemplateSource {
+    /// Derive the GitHub API releases endpoint from the source URL.
+    /// Returns None for Archive sources (version is fixed in the URL).
+    fn releases_api_url(&self) -> Option<String> {
+        let repo_url = match self {
+            TemplateSource::Tree { repo_url, .. } => repo_url,
+            TemplateSource::Repo { repo_url } => repo_url,
+            TemplateSource::Archive { .. } => return None,
+        };
+        github_releases_api(repo_url)
     }
-    // git fetch origin — update remote tracking refs
-    let fetch_ok = configured_command("git")
-        .args(["fetch", "origin", "--quiet"])
+}
+
+/// Derive GitHub releases API URL from a repository URL.
+/// e.g. "https://github.com/org/repo" -> "https://api.github.com/repos/org/repo/releases/latest"
+fn github_releases_api(repo_url: &str) -> Option<String> {
+    let repo_url = repo_url.trim_end_matches('/').trim_end_matches(".git");
+    // Extract org/repo from URL like https://github.com/org/repo or git@github.com:org/repo.git
+    let path = if let Some(rest) = repo_url.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = repo_url.strip_prefix("http://github.com/") {
+        rest
+    } else if let Some(rest) = repo_url.strip_prefix("git@github.com:") {
+        rest
+    } else {
+        return None;
+    };
+    let parts: Vec<&str> = path.split('/').take(2).collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    Some(format!("https://api.github.com/repos/{}/{}/releases/latest", parts[0], parts[1]))
+}
+
+/// Query the GitHub releases API for the latest release tag of the template repository.
+fn latest_template_release_tag(api_url: &str) -> Option<String> {
+    let output = configured_command(curl_program())
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "--retry",
+            "2",
+            "-H",
+            "Accept: application/vnd.github+json",
+            api_url,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    json.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Return the currently checked-out template version (git tag) from the cache directory.
+fn current_template_version() -> Option<String> {
+    let cache_dir = template_cache_dir()?;
+    if !cache_dir.is_dir() {
+        return None;
+    }
+    let output = configured_command("git")
+        .args(["describe", "--tags", "--exact-match", "HEAD"])
         .current_dir(&cache_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if tag.is_empty() { None } else { Some(tag) }
+}
+
+/// Parse a template source URL into a TemplateSource variant.
+fn parse_template_source_url(url: &str) -> Result<TemplateSource, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("Template URL cannot be empty".to_string());
+    }
+    // Tree URL: https://github.com/org/repo/tree/branch/path
+    if url.starts_with("https://") || url.starts_with("http://") {
+        if let Some(pos) = url.find("/tree/") {
+            let repo_url = url[..pos].to_string();
+            let remainder = &url[pos + 6..]; // skip "/tree/"
+            let (branch, sub_path) = match remainder.find('/') {
+                Some(slash_pos) => (
+                    remainder[..slash_pos].to_string(),
+                    remainder[slash_pos + 1..].to_string(),
+                ),
+                None => (remainder.to_string(), String::new()),
+            };
+            if branch.is_empty() {
+                return Err("Tree URL has empty branch".to_string());
+            }
+            return Ok(TemplateSource::Tree { repo_url, branch, sub_path });
+        }
+        // Archive URL: https://github.com/org/repo/archive/refs/tags/v1.0.0.tar.gz
+        if url.contains("/archive/") {
+            let strip_prefix = archive_strip_prefix(url)?;
+            return Ok(TemplateSource::Archive { url: url.to_string(), strip_prefix });
+        }
+    }
+    // Plain repo URL
+    if url.starts_with("https://") || url.starts_with("git@") {
+        return Ok(TemplateSource::Repo { repo_url: url.to_string() });
+    }
+    Err(format!("Invalid template URL: {url}"))
+}
+
+/// Extract the strip prefix for a GitHub archive URL.
+/// e.g. https://github.com/org/repo/archive/refs/tags/v0.1.0.tar.gz -> "repo-v0.1.0"
+fn archive_strip_prefix(url: &str) -> Result<String, String> {
+    // Standard GitHub archive format: https://github.com/{org}/{repo}/archive/...
+    let parts: Vec<&str> = url.split('/').collect();
+    // Minimum: https: / / github.com / org / repo / archive / ...
+    if parts.len() < 6 {
+        return Err(format!("Invalid archive URL format: {url}"));
+    }
+    let repo_name = parts[4]; // repo name after org
+    if let Some(tag_start) = url.rfind("refs/tags/") {
+        let tag_part = &url[tag_start + "refs/tags/".len()..];
+        let tag = tag_part.trim_end_matches(".tar.gz").trim_end_matches(".zip");
+        Ok(format!("{repo_name}-{tag}"))
+    } else if let Some(branch_start) = url.rfind("refs/heads/") {
+        let branch_part = &url[branch_start + "refs/heads/".len()..];
+        let branch = branch_part.trim_end_matches(".tar.gz").trim_end_matches(".zip");
+        Ok(format!("{repo_name}-{branch}"))
+    } else {
+        Ok(repo_name.to_string())
+    }
+}
+
+/// Replace the cache directory with a subdirectory's content.
+/// Moves `sub_path` inside `cache_dir` to become the new cache root.
+fn promote_subdirectory(cache_dir: &Path, sub_path: &str) -> Result<(), String> {
+    let source_path = cache_dir.join(sub_path);
+    if !source_path.is_dir() {
+        return Err(format!("Path '{sub_path}' not found in downloaded content"));
+    }
+    let temp_dir = cache_dir.with_extension("promote-temp");
+    if temp_dir.exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+    fs::rename(&source_path, &temp_dir)
+        .map_err(|e| format!("Failed to move '{sub_path}': {e}"))?;
+    if let Err(e) = fs::remove_dir_all(cache_dir) {
+        // Attempt to restore on failure
+        let _ = fs::rename(&temp_dir, &source_path);
+        return Err(format!("Failed to clean cache directory: {e}"));
+    }
+    fs::rename(&temp_dir, cache_dir)
+        .map_err(|e| format!("Failed to finalize cache directory: {e}"))
+}
+
+/// Fetch templates from a parsed source URL into the cache directory.
+fn fetch_templates(cache_dir: &Path, source: &TemplateSource) -> Result<(), String> {
+    let parent = cache_dir.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create parent directory: {e}"))?;
+    match source {
+        TemplateSource::Tree { repo_url, branch, sub_path } => {
+            fetch_from_tree(cache_dir, repo_url, branch, sub_path)
+        }
+        TemplateSource::Archive { url, strip_prefix } => {
+            fetch_from_archive(cache_dir, url, strip_prefix)
+        }
+        TemplateSource::Repo { repo_url } => {
+            fetch_from_repo(cache_dir, repo_url, source)
+        }
+    }
+}
+
+/// Clone a git repo at a specific branch, optionally promoting a subdirectory.
+fn fetch_from_tree(cache_dir: &Path, repo_url: &str, branch: &str, sub_path: &str) -> Result<(), String> {
+    eprintln!("[templates] Cloning {repo_url} (branch: {branch})...");
+    if cache_dir.is_dir() {
+        fs::remove_dir_all(cache_dir)
+            .map_err(|e| format!("Failed to remove template cache: {e}"))?;
+    }
+    let clone_ok = configured_command("git")
+        .args(["clone", "--quiet", "--depth", "1", "--branch", branch, repo_url, cache_dir.to_str().unwrap_or("")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    if !fetch_ok {
+    if !clone_ok {
+        return Err(format!("Failed to clone branch '{branch}' from {repo_url}"));
+    }
+    if !sub_path.is_empty() {
+        promote_subdirectory(cache_dir, sub_path)?;
+    }
+    eprintln!("[templates] Tree source ready at {}", cache_dir.display());
+    Ok(())
+}
+
+/// Download and extract a tarball archive.
+fn fetch_from_archive(cache_dir: &Path, url: &str, strip_prefix: &str) -> Result<(), String> {
+    eprintln!("[templates] Downloading archive {url}...");
+    if cache_dir.is_dir() {
+        fs::remove_dir_all(cache_dir)
+            .map_err(|e| format!("Failed to remove template cache: {e}"))?;
+    }
+    fs::create_dir_all(cache_dir)
+        .map_err(|e| format!("Failed to create cache directory: {e}"))?;
+    let tar_path = cache_dir.with_extension("download.tar.gz");
+    let download_ok = configured_command(curl_program())
+        .args(["-fsSL", "--connect-timeout", "10", "--max-time", "120", "--retry", "2", "-o", tar_path.to_str().unwrap_or(""), url])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !download_ok {
+        let _ = fs::remove_file(&tar_path);
+        return Err(format!("Failed to download template archive: {url}"));
+    }
+    let extract_ok = configured_command("tar")
+        .args(["-xzf", tar_path.to_str().unwrap_or(""), "-C", cache_dir.to_str().unwrap_or("")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let _ = fs::remove_file(&tar_path);
+    if !extract_ok {
+        return Err("Failed to extract template archive".to_string());
+    }
+    if !strip_prefix.is_empty() {
+        promote_subdirectory(cache_dir, strip_prefix)?;
+    }
+    eprintln!("[templates] Archive extracted to {}", cache_dir.display());
+    Ok(())
+}
+
+/// Clone the entire repository, optionally checking out the latest release tag.
+fn fetch_from_repo(cache_dir: &Path, repo_url: &str, source: &TemplateSource) -> Result<(), String> {
+    eprintln!("[templates] Cloning repository {repo_url}...");
+    if cache_dir.is_dir() {
+        fs::remove_dir_all(cache_dir)
+            .map_err(|e| format!("Failed to remove template cache: {e}"))?;
+    }
+    let clone_ok = configured_command("git")
+        .args(["clone", "--quiet", repo_url, cache_dir.to_str().unwrap_or("")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !clone_ok {
+        return Err(format!("Failed to clone template repository: {repo_url}"));
+    }
+    // Checkout the latest release tag if available
+    if let Some(api_url) = source.releases_api_url() {
+        if let Some(tag) = latest_template_release_tag(&api_url) {
+            eprintln!("[templates] Checking out release tag: {tag}");
+            let _ = configured_command("git")
+                .args(["fetch", "origin", "--quiet", "--tags"])
+                .current_dir(cache_dir)
+                .output();
+            let _ = configured_command("git")
+                .args(["checkout", &tag, "--quiet"])
+                .current_dir(cache_dir)
+                .output();
+        }
+    }
+    eprintln!("[templates] Repository cloned to {}", cache_dir.display());
+    Ok(())
+}
+
+/// Resolve the effective template URL: user override takes precedence over the default.
+fn resolve_template_url(user_url: &str) -> String {
+    let user_url = user_url.trim();
+    if !user_url.is_empty() {
+        return user_url.to_string();
+    }
+    load_runtime_requirements(DEFAULT_RUNTIME_REQUIREMENTS)
+        .map(|r| r.sources.template_repo_url)
+        .unwrap_or_else(|_| "https://github.com/agentseek-ai/agentseek-templates".to_string())
+}
+
+/// Delete the template cache and re-fetch templates from the configured URL.
+fn update_template_cache(template_url: &str) -> Result<(), String> {
+    let cache_dir = template_cache_dir()
+        .ok_or_else(|| "HOME environment variable is not set".to_string())?;
+    let url = resolve_template_url(template_url);
+    let source = parse_template_source_url(&url)?;
+    fetch_templates(&cache_dir, &source)
+}
+
+/// Ensure the template cache exists. Called lazily when listing templates.
+fn ensure_template_cache(template_url: &str) {
+    let Some(cache_dir) = template_cache_dir() else {
+        return;
+    };
+    if cache_dir.is_dir() {
         return;
     }
-    // git reset --hard FETCH_HEAD — sync working tree to latest remote commit
-    let _ = configured_command("git")
-        .args(["reset", "--hard", "FETCH_HEAD"])
-        .current_dir(&cache_dir)
-        .output();
+    let url = resolve_template_url(template_url);
+    if let Ok(source) = parse_template_source_url(&url) {
+        let _ = fetch_templates(&cache_dir, &source);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod template_url_tests {
+    use super::*;
+
+    #[test]
+    fn parse_tree_url_with_subpath() {
+        let result = parse_template_source_url("https://github.com/agentseek-ai/agentseek-templates/tree/main/templates");
+        assert_eq!(result.unwrap(), TemplateSource::Tree {
+            repo_url: "https://github.com/agentseek-ai/agentseek-templates".to_string(),
+            branch: "main".to_string(),
+            sub_path: "templates".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_tree_url_without_subpath() {
+        let result = parse_template_source_url("https://github.com/org/repo/tree/develop");
+        assert_eq!(result.unwrap(), TemplateSource::Tree {
+            repo_url: "https://github.com/org/repo".to_string(),
+            branch: "develop".to_string(),
+            sub_path: String::new(),
+        });
+    }
+
+    #[test]
+    fn parse_tree_url_with_nested_subpath() {
+        let result = parse_template_source_url("https://github.com/org/repo/tree/main/path/to/templates");
+        assert_eq!(result.unwrap(), TemplateSource::Tree {
+            repo_url: "https://github.com/org/repo".to_string(),
+            branch: "main".to_string(),
+            sub_path: "path/to/templates".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_archive_url_tag() {
+        let result = parse_template_source_url("https://github.com/agentseek-ai/agentseek-templates/archive/refs/tags/v0.1.0.tar.gz");
+        assert_eq!(result.unwrap(), TemplateSource::Archive {
+            url: "https://github.com/agentseek-ai/agentseek-templates/archive/refs/tags/v0.1.0.tar.gz".to_string(),
+            strip_prefix: "agentseek-templates-v0.1.0".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_archive_url_branch() {
+        let result = parse_template_source_url("https://github.com/org/repo/archive/refs/heads/main.tar.gz");
+        assert_eq!(result.unwrap(), TemplateSource::Archive {
+            url: "https://github.com/org/repo/archive/refs/heads/main.tar.gz".to_string(),
+            strip_prefix: "repo-main".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_plain_repo_url() {
+        let result = parse_template_source_url("https://github.com/agentseek-ai/agentseek-templates");
+        assert_eq!(result.unwrap(), TemplateSource::Repo {
+            repo_url: "https://github.com/agentseek-ai/agentseek-templates".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_git_ssh_url() {
+        let result = parse_template_source_url("git@github.com:org/repo.git");
+        assert_eq!(result.unwrap(), TemplateSource::Repo {
+            repo_url: "git@github.com:org/repo.git".to_string(),
+        });
+    }
+
+    #[test]
+    fn parse_empty_url_fails() {
+        assert!(parse_template_source_url("").is_err());
+        assert!(parse_template_source_url("   ").is_err());
+    }
+
+    #[test]
+    fn parse_invalid_url_fails() {
+        assert!(parse_template_source_url("ftp://example.com/repo").is_err());
+        assert!(parse_template_source_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn parse_url_with_whitespace_is_trimmed() {
+        let result = parse_template_source_url("  https://github.com/org/repo  ");
+        assert_eq!(result.unwrap(), TemplateSource::Repo {
+            repo_url: "https://github.com/org/repo".to_string(),
+        });
+    }
+
+    #[test]
+    fn github_releases_api_from_https() {
+        let api = github_releases_api("https://github.com/org/repo");
+        assert_eq!(api.unwrap(), "https://api.github.com/repos/org/repo/releases/latest");
+    }
+
+    #[test]
+    fn github_releases_api_from_https_with_git_suffix() {
+        let api = github_releases_api("https://github.com/org/repo.git");
+        assert_eq!(api.unwrap(), "https://api.github.com/repos/org/repo/releases/latest");
+    }
+
+    #[test]
+    fn github_releases_api_from_ssh() {
+        let api = github_releases_api("git@github.com:org/repo.git");
+        assert_eq!(api.unwrap(), "https://api.github.com/repos/org/repo/releases/latest");
+    }
+
+    #[test]
+    fn github_releases_api_from_non_github() {
+        assert!(github_releases_api("https://gitlab.com/org/repo").is_none());
+    }
+
+    #[test]
+    fn template_source_releases_api() {
+        let tree = TemplateSource::Tree {
+            repo_url: "https://github.com/org/repo".to_string(),
+            branch: "main".to_string(),
+            sub_path: "templates".to_string(),
+        };
+        assert_eq!(
+            tree.releases_api_url().unwrap(),
+            "https://api.github.com/repos/org/repo/releases/latest"
+        );
+        let archive = TemplateSource::Archive {
+            url: "https://github.com/org/repo/archive/refs/tags/v1.tar.gz".to_string(),
+            strip_prefix: "repo-v1".to_string(),
+        };
+        assert!(archive.releases_api_url().is_none());
+    }
+
+    #[test]
+    fn resolve_template_url_prefers_user_override() {
+        assert_eq!(resolve_template_url("https://custom.example.com/templates"), "https://custom.example.com/templates");
+    }
+
+    #[test]
+    fn resolve_template_url_trims_whitespace() {
+        assert_eq!(resolve_template_url("  https://custom.example.com/templates  "), "https://custom.example.com/templates");
+    }
 }

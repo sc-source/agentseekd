@@ -68,6 +68,10 @@ pub fn run() {
             runtime_install_progress,
             execute_runtime_install,
             list_templates,
+            check_template_update,
+            update_templates,
+            get_template_url,
+            save_template_url,
             list_instances,
             list_vault,
             save_vault,
@@ -2039,6 +2043,7 @@ url = \"http://127.0.0.1:5174\"\n";
             password: "should_not_be_persisted".to_string(),
             runtime_log_retention_days: 7,
             setup_completed: false,
+            template_url: String::new(),
         };
         write_storage_config(&path, &config).expect("write config");
         let content = fs::read_to_string(&path).expect("read config file");
