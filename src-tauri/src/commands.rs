@@ -211,16 +211,18 @@ fn check_template_update(state: State<'_, DesktopState>) -> Result<TemplateUpdat
         .template_url
         .clone();
     let url = resolve_template_url(&template_url);
-    // Archive sources pin the version in the URL itself; there is nothing to check.
     let Ok(source) = parse_template_source_url(&url) else {
         return Ok(no_check);
     };
-    let Some(api_url) = source.releases_api_url() else {
+    // Tree and Releases sources support version checking via GitHub Releases API.
+    let Some((api_url, _)) = source.releases_info() else {
         return Ok(no_check);
     };
     let current = current_template_version().unwrap_or_default();
     let latest = latest_template_release_tag(&api_url).unwrap_or_default();
-    let has_update = !latest.is_empty() && !current.is_empty() && current != latest;
+    // For non-Releases types (e.g., specific tree), if latest from releases API is empty or equals current, treat as no update.
+    let has_update = !latest.is_empty() && !current.is_empty() && current != latest
+        || matches!(source, TemplateSource::Releases { .. }) && !latest.is_empty() && current.is_empty();
     Ok(TemplateUpdateCheck {
         current_version: current,
         latest_version: latest,

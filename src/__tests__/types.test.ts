@@ -247,13 +247,13 @@ describe("type serialization shapes", () => {
 
   it("TemplateUpdateCheck has all fields", () => {
     const obj: TemplateUpdateCheck = {
-      currentVersion: "v1.0.0",
-      latestVersion: "v1.1.0",
+      currentVersion: "vX.Y.Z",
+      latestVersion: "vX.Y.Z+1",
       hasUpdate: true,
     };
     expect(obj.hasUpdate).toBe(true);
-    expect(obj.currentVersion).toBe("v1.0.0");
-    expect(obj.latestVersion).toBe("v1.1.0");
+    expect(obj.currentVersion).toBe("vX.Y.Z");
+    expect(obj.latestVersion).toBe("vX.Y.Z+1");
   });
 
   it("RuntimeInstallPlan has all fields", () => {

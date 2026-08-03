@@ -163,7 +163,7 @@ export const desktopApi = {
   async checkTemplateUpdate(): Promise<TemplateUpdateCheck> {
     if (isTauri()) return invoke("check_template_update");
     await wait(200);
-    return { currentVersion: "v1.0.0", latestVersion: "v1.0.0", hasUpdate: false };
+    return { currentVersion: "vX.Y.Z", latestVersion: "vX.Y.Z", hasUpdate: false };
   },
 
   async updateTemplates(): Promise<TemplateInfo[]> {

@@ -662,25 +662,33 @@ enum TemplateSource {
         branch: String,
         sub_path: String,
     },
-    /// Archive URL: https://github.com/org/repo/archive/refs/tags/v1.0.0.tar.gz
-    Archive {
-        url: String,
-        strip_prefix: String,
+    /// GitHub releases URL (fetch latest release tag dynamically)
+    Releases {
+        repo_url: String,
     },
     /// Plain git repository URL (clone entire repo)
     Repo { repo_url: String },
 }
 
 impl TemplateSource {
-    /// Derive the GitHub API releases endpoint from the source URL.
-    /// Returns None for Archive sources (version is fixed in the URL).
-    fn releases_api_url(&self) -> Option<String> {
+    /// Returns the GitHub releases API URL and the latest release tag.
+    fn releases_info(&self) -> Option<(String, String)> {
         let repo_url = match self {
             TemplateSource::Tree { repo_url, .. } => repo_url,
+            TemplateSource::Releases { repo_url } => repo_url,
             TemplateSource::Repo { repo_url } => repo_url,
-            TemplateSource::Archive { .. } => return None,
         };
-        github_releases_api(repo_url)
+        let api_url = github_releases_api(repo_url)?;
+        Some((api_url, repo_url.clone()))
+    }
+
+    /// Derive just the repo URL from the source (for backward compatibility).
+    pub(crate) fn repo_url(&self) -> Option<String> {
+        match self {
+            TemplateSource::Tree { repo_url, .. } => Some(repo_url.clone()),
+            TemplateSource::Releases { repo_url } => Some(repo_url.clone()),
+            TemplateSource::Repo { repo_url } => Some(repo_url.clone()),
+        }
     }
 }
 
@@ -756,6 +764,10 @@ fn parse_template_source_url(url: &str) -> Result<TemplateSource, String> {
     if url.is_empty() {
         return Err("Template URL cannot be empty".to_string());
     }
+    // Disallow insecure HTTP URLs
+    if url.starts_with("http://") && !url.starts_with("http://localhost") {
+        return Err("Insecure HTTP URLs are not supported, use HTTPS instead".to_string());
+    }
     // Tree URL: https://github.com/org/repo/tree/branch/path
     if url.starts_with("https://") || url.starts_with("http://") {
         if let Some(pos) = url.find("/tree/") {
@@ -768,15 +780,19 @@ fn parse_template_source_url(url: &str) -> Result<TemplateSource, String> {
                 ),
                 None => (remainder.to_string(), String::new()),
             };
+            if sub_path.contains("..") {
+                return Err("Path traversal is not allowed in sub_path".to_string());
+            }
             if branch.is_empty() {
                 return Err("Tree URL has empty branch".to_string());
             }
             return Ok(TemplateSource::Tree { repo_url, branch, sub_path });
         }
-        // Archive URL: https://github.com/org/repo/archive/refs/tags/v1.0.0.tar.gz
-        if url.contains("/archive/") {
-            let strip_prefix = archive_strip_prefix(url)?;
-            return Ok(TemplateSource::Archive { url: url.to_string(), strip_prefix });
+        // Releases URL: https://github.com/org/repo/releases or https://github.com/org/repo/releases/latest
+        if url.ends_with("/releases") || url.ends_with("/releases/latest") {
+            let repo_url = url.strip_suffix("/releases").or_else(|| url.strip_suffix("/releases/latest"))
+                .unwrap_or(url).to_string();
+            return Ok(TemplateSource::Releases { repo_url });
         }
     }
     // Plain repo URL
@@ -786,28 +802,6 @@ fn parse_template_source_url(url: &str) -> Result<TemplateSource, String> {
     Err(format!("Invalid template URL: {url}"))
 }
 
-/// Extract the strip prefix for a GitHub archive URL.
-/// e.g. https://github.com/org/repo/archive/refs/tags/v0.1.0.tar.gz -> "repo-v0.1.0"
-fn archive_strip_prefix(url: &str) -> Result<String, String> {
-    // Standard GitHub archive format: https://github.com/{org}/{repo}/archive/...
-    let parts: Vec<&str> = url.split('/').collect();
-    // Minimum: https: / / github.com / org / repo / archive / ...
-    if parts.len() < 6 {
-        return Err(format!("Invalid archive URL format: {url}"));
-    }
-    let repo_name = parts[4]; // repo name after org
-    if let Some(tag_start) = url.rfind("refs/tags/") {
-        let tag_part = &url[tag_start + "refs/tags/".len()..];
-        let tag = tag_part.trim_end_matches(".tar.gz").trim_end_matches(".zip");
-        Ok(format!("{repo_name}-{tag}"))
-    } else if let Some(branch_start) = url.rfind("refs/heads/") {
-        let branch_part = &url[branch_start + "refs/heads/".len()..];
-        let branch = branch_part.trim_end_matches(".tar.gz").trim_end_matches(".zip");
-        Ok(format!("{repo_name}-{branch}"))
-    } else {
-        Ok(repo_name.to_string())
-    }
-}
 
 /// Replace the cache directory with a subdirectory's content.
 /// Moves `sub_path` inside `cache_dir` to become the new cache root.
@@ -840,11 +834,8 @@ fn fetch_templates(cache_dir: &Path, source: &TemplateSource) -> Result<(), Stri
         TemplateSource::Tree { repo_url, branch, sub_path } => {
             fetch_from_tree(cache_dir, repo_url, branch, sub_path)
         }
-        TemplateSource::Archive { url, strip_prefix } => {
-            fetch_from_archive(cache_dir, url, strip_prefix)
-        }
-        TemplateSource::Repo { repo_url } => {
-            fetch_from_repo(cache_dir, repo_url, source)
+        TemplateSource::Releases { .. } | TemplateSource::Repo { .. } => {
+            fetch_from_repo(cache_dir, "", source)
         }
     }
 }
@@ -871,69 +862,55 @@ fn fetch_from_tree(cache_dir: &Path, repo_url: &str, branch: &str, sub_path: &st
     Ok(())
 }
 
-/// Download and extract a tarball archive.
-fn fetch_from_archive(cache_dir: &Path, url: &str, strip_prefix: &str) -> Result<(), String> {
-    eprintln!("[templates] Downloading archive {url}...");
-    if cache_dir.is_dir() {
-        fs::remove_dir_all(cache_dir)
-            .map_err(|e| format!("Failed to remove template cache: {e}"))?;
-    }
-    fs::create_dir_all(cache_dir)
-        .map_err(|e| format!("Failed to create cache directory: {e}"))?;
-    let tar_path = cache_dir.with_extension("download.tar.gz");
-    let download_ok = configured_command(curl_program())
-        .args(["-fsSL", "--connect-timeout", "10", "--max-time", "120", "--retry", "2", "-o", tar_path.to_str().unwrap_or(""), url])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !download_ok {
-        let _ = fs::remove_file(&tar_path);
-        return Err(format!("Failed to download template archive: {url}"));
-    }
-    let extract_ok = configured_command("tar")
-        .args(["-xzf", tar_path.to_str().unwrap_or(""), "-C", cache_dir.to_str().unwrap_or("")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let _ = fs::remove_file(&tar_path);
-    if !extract_ok {
-        return Err("Failed to extract template archive".to_string());
-    }
-    if !strip_prefix.is_empty() {
-        promote_subdirectory(cache_dir, strip_prefix)?;
-    }
-    eprintln!("[templates] Archive extracted to {}", cache_dir.display());
-    Ok(())
-}
-
 /// Clone the entire repository, optionally checking out the latest release tag.
-fn fetch_from_repo(cache_dir: &Path, repo_url: &str, source: &TemplateSource) -> Result<(), String> {
-    eprintln!("[templates] Cloning repository {repo_url}...");
+fn fetch_from_repo(cache_dir: &Path, _repo_url_arg: &str, source: &TemplateSource) -> Result<(), String> {
+    let repo_url = source.repo_url().unwrap_or_default();
+    eprintln!("[templates] Cloning repository {}...", repo_url);
     if cache_dir.is_dir() {
         fs::remove_dir_all(cache_dir)
             .map_err(|e| format!("Failed to remove template cache: {e}"))?;
+    }
+    // Determine git URL and optional tag
+    let (git_url, checkout_tag) = match source {
+        TemplateSource::Releases { .. } => {
+            // For Releases type: clone without --branch first, then fetch + checkout tag
+            let api_url = source.releases_info().and_then(|(api, _)| {
+                latest_template_release_tag(&api).map(|tag| (api, tag))
+            }).map(|(api, _)| api);
+            match api_url {
+                Some(api) => {
+                    let tag = latest_template_release_tag(&api).unwrap_or_default();
+                    (Some(repo_url.clone()), if tag.is_empty() { None } else { Some(tag) })
+                }
+                None => (Some(repo_url.clone()), None),
+            }
+        }
+        TemplateSource::Repo { .. } => (Some(repo_url.clone()), None),
+        _ => return Err("Invalid source type for fetch_from_repo".to_string()),
+    };
+    let url = git_url.as_ref().map(|s| s.as_str()).unwrap_or("");
+    if url.is_empty() {
+        return Err("Repository URL is empty".to_string());
     }
     let clone_ok = configured_command("git")
-        .args(["clone", "--quiet", repo_url, cache_dir.to_str().unwrap_or("")])
+        .args(["clone", "--quiet", url, cache_dir.to_str().unwrap_or("")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !clone_ok {
-        return Err(format!("Failed to clone template repository: {repo_url}"));
+        return Err(format!("Failed to clone template repository: {url}"));
     }
     // Checkout the latest release tag if available
-    if let Some(api_url) = source.releases_api_url() {
-        if let Some(tag) = latest_template_release_tag(&api_url) {
-            eprintln!("[templates] Checking out release tag: {tag}");
-            let _ = configured_command("git")
-                .args(["fetch", "origin", "--quiet", "--tags"])
-                .current_dir(cache_dir)
-                .output();
-            let _ = configured_command("git")
-                .args(["checkout", &tag, "--quiet"])
-                .current_dir(cache_dir)
-                .output();
-        }
+    if let Some(ref tag) = checkout_tag {
+        eprintln!("[templates] Checking out release tag: {tag}");
+        let _ = configured_command("git")
+            .args(["fetch", "origin", "--quiet", "--tags"])
+            .current_dir(cache_dir)
+            .output();
+        let _ = configured_command("git")
+            .args(["checkout", tag, "--quiet"])
+            .current_dir(cache_dir)
+            .output();
     }
     eprintln!("[templates] Repository cloned to {}", cache_dir.display());
     Ok(())
@@ -947,7 +924,7 @@ fn resolve_template_url(user_url: &str) -> String {
     }
     load_runtime_requirements(DEFAULT_RUNTIME_REQUIREMENTS)
         .map(|r| r.sources.template_repo_url)
-        .unwrap_or_else(|_| "https://github.com/agentseek-ai/agentseek-templates".to_string())
+        .unwrap_or_else(|_| "https://github.com/agentseek-ai/agentseek-templates/releases".to_string())
 }
 
 /// Delete the template cache and re-fetch templates from the configured URL.
@@ -1012,24 +989,6 @@ mod template_url_tests {
     }
 
     #[test]
-    fn parse_archive_url_tag() {
-        let result = parse_template_source_url("https://github.com/agentseek-ai/agentseek-templates/archive/refs/tags/v0.1.0.tar.gz");
-        assert_eq!(result.unwrap(), TemplateSource::Archive {
-            url: "https://github.com/agentseek-ai/agentseek-templates/archive/refs/tags/v0.1.0.tar.gz".to_string(),
-            strip_prefix: "agentseek-templates-v0.1.0".to_string(),
-        });
-    }
-
-    #[test]
-    fn parse_archive_url_branch() {
-        let result = parse_template_source_url("https://github.com/org/repo/archive/refs/heads/main.tar.gz");
-        assert_eq!(result.unwrap(), TemplateSource::Archive {
-            url: "https://github.com/org/repo/archive/refs/heads/main.tar.gz".to_string(),
-            strip_prefix: "repo-main".to_string(),
-        });
-    }
-
-    #[test]
     fn parse_plain_repo_url() {
         let result = parse_template_source_url("https://github.com/agentseek-ai/agentseek-templates");
         assert_eq!(result.unwrap(), TemplateSource::Repo {
@@ -1089,21 +1048,22 @@ mod template_url_tests {
     }
 
     #[test]
-    fn template_source_releases_api() {
+    fn template_source_releases_info() {
         let tree = TemplateSource::Tree {
             repo_url: "https://github.com/org/repo".to_string(),
             branch: "main".to_string(),
             sub_path: "templates".to_string(),
         };
-        assert_eq!(
-            tree.releases_api_url().unwrap(),
-            "https://api.github.com/repos/org/repo/releases/latest"
-        );
-        let archive = TemplateSource::Archive {
-            url: "https://github.com/org/repo/archive/refs/tags/v1.tar.gz".to_string(),
-            strip_prefix: "repo-v1".to_string(),
+        let (api_url, repo_url) = tree.releases_info().unwrap();
+        assert_eq!(api_url, "https://api.github.com/repos/org/repo/releases/latest");
+        assert_eq!(repo_url, "https://github.com/org/repo");
+        
+        let releases = TemplateSource::Releases {
+            repo_url: "https://github.com/other/repo".to_string(),
         };
-        assert!(archive.releases_api_url().is_none());
+        let (api_url, repo_url) = releases.releases_info().unwrap();
+        assert_eq!(api_url, "https://api.github.com/repos/other/repo/releases/latest");
+        assert_eq!(repo_url, "https://github.com/other/repo");
     }
 
     #[test]

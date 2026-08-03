@@ -1693,9 +1693,9 @@ export default function App() {
                 />
               </label>
               <div style={{ marginTop: "12px", fontSize: "0.85em", opacity: 0.7 }}>
-                <div>{tr("templateUrlExample")}:</div>
-                <code style={{ display: "block", marginTop: "4px", wordBreak: "break-all" }}>https://github.com/agentseek-ai/agentseek-templates/tree/main/templates</code>
-                <code style={{ display: "block", marginTop: "4px", wordBreak: "break-all" }}>https://github.com/agentseek-ai/agentseek-templates/archive/refs/tags/v0.1.0.tar.gz</code>
+                <div>{tr("templateUrlExample")}: </div>
+                <code style={{ display: "block", marginTop: "4px", wordBreak: "break-all" }}>https://github.com/org/repo/releases</code>
+                <code style={{ display: "block", marginTop: "4px", wordBreak: "break-all" }}>https://github.com/org/repo/tree/main/templates</code>
               </div>
             </div>
             <div className="modal-foot"><button className="button secondary" onClick={() => setTemplateUrlEditOpen(false)} type="button">{tr("cancel")}</button><button className="button primary" onClick={() => void saveTemplateUrl()} disabled={templateUrlSaving || !templateUrlInput.trim()} type="button">{templateUrlSaving ? <LoaderCircle className="spin" /> : <Check />}{tr("saveVault")}</button></div>
