@@ -264,7 +264,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ inputs.tag }}
-          name: Release ${{ inputs.tag }}
+          name: AgentSeek Desktop ${{ inputs.tag }}
           bodyFile: RELEASE_BODY.md
           artifacts: release-assets/*
           artifactErrorsFailBuild: true
