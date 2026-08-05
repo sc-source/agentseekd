@@ -217,11 +217,18 @@ jobs:
               ;;
           esac
 
-          # Normalize product names with spaces (e.g. "AgentSeek Desktop")
-          # to underscores on every platform so artifact paths never contain
-          # spaces and all bundles follow the AgentSeek_Desktop_* convention.
+          # Normalize bundle names to the AgentSeek_Desktop_* convention on
+          # every platform: productName spaces appear as spaces in some Tauri
+          # bundles and as dots ("AgentSeek.Desktop_...") in Linux/Windows
+          # ones. Replace only the product-name prefix, never version dots.
           for f in "$ARTIFACT_DIR"/*; do
-            [ -e "$f" ] && mv "$f" "${f// /_}" 2>/dev/null || true
+            [ -e "$f" ] || continue
+            b="$(basename "$f")"
+            b="${b// /_}"
+            b="${b/AgentSeek.Desktop_/AgentSeek_Desktop_}"
+            if [ "$b" != "$(basename "$f")" ]; then
+              mv "$f" "$(dirname "$f")/$b" 2>/dev/null || true
+            fi
           done
 
           if [ -z "$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -print -quit)" ]; then
