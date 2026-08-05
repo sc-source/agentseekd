@@ -1,4 +1,5 @@
 name: Build
+run-name: Build ${{ github.ref_name }}
 
 # Expensive desktop bundle builds only run on release-track events:
 #   - tag push v*       (actual release)

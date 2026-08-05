@@ -1,4 +1,5 @@
 name: Sign & Notarize
+run-name: Sign & Notarize ${{ inputs.tag }}
 
 # Manual-only: downloads build artifacts → signs + notarizes + staples macOS DMGs → creates GitHub Release.
 # Prerequisite: Build workflow has completed for the given tag.
