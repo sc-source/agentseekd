@@ -1,23 +1,5 @@
 // CLI runtime detection: version comparison, dependency checking,
-// agentseek/uv program resolution, and template parsing.
-
-fn display_name(template_id: &str) -> String {
-    template_id
-        .split('/')
-        .next_back()
-        .unwrap_or(template_id)
-        .split(['-', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            chars
-                .next()
-                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+// agentseek/uv program resolution, and CLI process execution.
 
 fn runtime_path() -> std::ffi::OsString {
     let mut paths = Vec::new();
@@ -338,18 +320,6 @@ fn uv_program() -> Option<String> {
     resolved_program("uv", "--version")
 }
 
-fn uv_tool_bin_dir() -> String {
-    uv_program()
-        .and_then(|uv| {
-            configured_command(&uv)
-                .args(["tool", "dir", "--bin"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        })
-        .unwrap_or_default()
-}
-
 fn agentseek_program() -> String {
     if let Ok(program) = env::var("AGENTSEEK_CLI") {
         return program;
@@ -590,489 +560,250 @@ fn current_cli_status(check_latest: bool) -> Result<CliStatus, String> {
     })
 }
 
-fn run_cli(args: &[&str], cwd: Option<&Path>) -> Result<CommandResult, String> {
+/// Execute the CLI with optional stdin input (for interactive cookiecutter prompts).
+/// Keeps stdin handle alive until the process exits to avoid EOF-induced infinite loops.
+fn run_cli_with_input(
+    args: &[&str],
+    cwd: Option<&Path>,
+    answers: Option<&str>,
+) -> Result<CommandResult, String> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     let (program, prefix) = cli_parts();
     let mut command = configured_command(&program);
     command.args(&prefix).args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
     let printable = std::iter::once(program.as_str())
         .chain(prefix.iter().map(String::as_str))
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
-    let output = command
-        .output()
+
+    let mut child = command
+        .spawn()
         .map_err(|error| format!("Unable to execute {printable}: {error}"))?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+
+    // Write answers to stdin (if provided) and keep the handle alive until
+    // the child exits. Dropping stdin early would send EOF, causing
+    // cookiecutter's `while True` prompt loop to spin forever.
+    let mut stdin_handle = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open stdin for child process".to_string())?;
+    if let Some(answers) = answers {
+        if let Err(error) = stdin_handle.write_all(answers.as_bytes()) {
+            let _ = stdin_handle.flush();
+            // The child cannot receive answers; fail fast instead of hanging.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Failed to write answers to CLI stdin: {error}"));
+        }
+        if let Err(error) = stdin_handle.flush() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Failed to flush CLI stdin: {error}"));
+        }
+    }
+
+    // Spawn threads to read stdout/stderr (prevents pipe buffer deadlock);
+    // results are delivered via channels so we can bound the join wait.
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to open stdout for child process".to_string())?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to open stderr for child process".to_string())?;
+    let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout_pipe.read_to_string(&mut s);
+        let _ = stdout_tx.send(s);
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        let _ = stderr_tx.send(s);
+    });
+
+    // Poll with timeout (10 minutes) to prevent infinite hang on EOF deadlock.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // Reap the child to avoid zombies.
+                    return Err(format!("Command timed out after 600 seconds: {printable}"));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Failed to wait for child process: {e}"));
+            }
+        }
+    };
+
+    // Child exited; safe to drop stdin now.
+    drop(stdin_handle);
+
+    // Bound the pipe-drain wait: a grandchild holding the pipe write end could
+    // otherwise keep the reader threads alive forever.
+    let stdout = stdout_rx.recv_timeout(Duration::from_secs(30)).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(Duration::from_secs(30)).unwrap_or_default();
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    let combined = format!("{}{}", stdout, stderr);
+
     Ok(CommandResult {
-        code: output.status.code().unwrap_or(1),
+        code: status.code().unwrap_or(1),
         output: combined.trim().to_string(),
         command: printable,
     })
 }
 
-fn parse_templates(output: &str) -> Vec<TemplateInfo> {
-    let mut templates = Vec::new();
-    let mut current: Option<usize> = None;
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let is_template = trimmed.contains('/')
-            && !trimmed.contains(' ')
-            && !trimmed.starts_with("http")
-            && trimmed.split('/').count() == 2;
-        if is_template {
-            let framework = trimmed.split('/').next().unwrap_or_default().to_string();
-            templates.push(TemplateInfo {
-                id: trimmed.to_string(),
-                name: display_name(trimmed),
-                description: String::new(),
-                framework,
-            });
-            current = Some(templates.len() - 1);
-        } else if let Some(index) = current {
-            if !trimmed.is_empty()
-                && !trimmed.chars().all(|character| character == '─')
-                && !trimmed.contains("templates)")
-            {
-                templates[index].description = trimmed.to_string();
-                current = None;
-            }
-        }
-    }
-    templates
-}
-
-/// Return the template cache directory path.
-fn template_cache_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| Path::new(&home).join(".cookiecutters").join("agentseek"))
-}
-
-/// Parsed template source from a URL.
-#[derive(Debug, PartialEq)]
-enum TemplateSource {
-    /// Git tree URL: https://github.com/org/repo/tree/branch/path
-    Tree {
-        repo_url: String,
-        branch: String,
-        sub_path: String,
-    },
-    /// GitHub releases URL (fetch latest release tag dynamically)
-    Releases {
-        repo_url: String,
-    },
-    /// Plain git repository URL (clone entire repo)
-    Repo { repo_url: String },
-}
-
-impl TemplateSource {
-    /// Returns the GitHub releases API URL and the latest release tag.
-    fn releases_info(&self) -> Option<(String, String)> {
-        let repo_url = match self {
-            TemplateSource::Tree { repo_url, .. } => repo_url,
-            TemplateSource::Releases { repo_url } => repo_url,
-            TemplateSource::Repo { repo_url } => repo_url,
-        };
-        let api_url = github_releases_api(repo_url)?;
-        Some((api_url, repo_url.clone()))
-    }
-
-    /// Derive just the repo URL from the source (for backward compatibility).
-    pub(crate) fn repo_url(&self) -> Option<String> {
-        match self {
-            TemplateSource::Tree { repo_url, .. } => Some(repo_url.clone()),
-            TemplateSource::Releases { repo_url } => Some(repo_url.clone()),
-            TemplateSource::Repo { repo_url } => Some(repo_url.clone()),
-        }
-    }
-}
-
-/// Derive GitHub releases API URL from a repository URL.
-/// e.g. "https://github.com/org/repo" -> "https://api.github.com/repos/org/repo/releases/latest"
-fn github_releases_api(repo_url: &str) -> Option<String> {
-    let repo_url = repo_url.trim_end_matches('/').trim_end_matches(".git");
-    // Extract org/repo from URL like https://github.com/org/repo or git@github.com:org/repo.git
-    let path = if let Some(rest) = repo_url.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = repo_url.strip_prefix("http://github.com/") {
-        rest
-    } else if let Some(rest) = repo_url.strip_prefix("git@github.com:") {
-        rest
-    } else {
-        return None;
-    };
-    let parts: Vec<&str> = path.split('/').take(2).collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    Some(format!("https://api.github.com/repos/{}/{}/releases/latest", parts[0], parts[1]))
-}
-
-/// Query the GitHub releases API for the latest release tag of the template repository.
-fn latest_template_release_tag(api_url: &str) -> Option<String> {
-    let output = configured_command(curl_program())
-        .args([
-            "-fsSL",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "15",
-            "--retry",
-            "2",
-            "-H",
-            "Accept: application/vnd.github+json",
-            api_url,
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    json.get("tag_name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Return the currently checked-out template version (git tag) from the cache directory.
-fn current_template_version() -> Option<String> {
-    let cache_dir = template_cache_dir()?;
-    if !cache_dir.is_dir() {
-        return None;
-    }
-    let output = configured_command("git")
-        .args(["describe", "--tags", "--exact-match", "HEAD"])
-        .current_dir(&cache_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if tag.is_empty() { None } else { Some(tag) }
-}
-
-/// Parse a template source URL into a TemplateSource variant.
-fn parse_template_source_url(url: &str) -> Result<TemplateSource, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("Template URL cannot be empty".to_string());
-    }
-    // Disallow insecure HTTP URLs
-    if url.starts_with("http://") && !url.starts_with("http://localhost") {
-        return Err("Insecure HTTP URLs are not supported, use HTTPS instead".to_string());
-    }
-    // Tree URL: https://github.com/org/repo/tree/branch/path
-    if url.starts_with("https://") || url.starts_with("http://") {
-        if let Some(pos) = url.find("/tree/") {
-            let repo_url = url[..pos].to_string();
-            let remainder = &url[pos + 6..]; // skip "/tree/"
-            let (branch, sub_path) = match remainder.find('/') {
-                Some(slash_pos) => (
-                    remainder[..slash_pos].to_string(),
-                    remainder[slash_pos + 1..].to_string(),
-                ),
-                None => (remainder.to_string(), String::new()),
-            };
-            if sub_path.contains("..") {
-                return Err("Path traversal is not allowed in sub_path".to_string());
-            }
-            if branch.is_empty() {
-                return Err("Tree URL has empty branch".to_string());
-            }
-            return Ok(TemplateSource::Tree { repo_url, branch, sub_path });
-        }
-        // Releases URL: https://github.com/org/repo/releases or https://github.com/org/repo/releases/latest
-        if url.ends_with("/releases") || url.ends_with("/releases/latest") {
-            let repo_url = url.strip_suffix("/releases").or_else(|| url.strip_suffix("/releases/latest"))
-                .unwrap_or(url).to_string();
-            return Ok(TemplateSource::Releases { repo_url });
-        }
-    }
-    // Plain repo URL
-    if url.starts_with("https://") || url.starts_with("git@") {
-        return Ok(TemplateSource::Repo { repo_url: url.to_string() });
-    }
-    Err(format!("Invalid template URL: {url}"))
-}
-
-
-/// Replace the cache directory with a subdirectory's content.
-/// Moves `sub_path` inside `cache_dir` to become the new cache root.
-fn promote_subdirectory(cache_dir: &Path, sub_path: &str) -> Result<(), String> {
-    let source_path = cache_dir.join(sub_path);
-    if !source_path.is_dir() {
-        return Err(format!("Path '{sub_path}' not found in downloaded content"));
-    }
-    let temp_dir = cache_dir.with_extension("promote-temp");
-    if temp_dir.exists() {
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-    fs::rename(&source_path, &temp_dir)
-        .map_err(|e| format!("Failed to move '{sub_path}': {e}"))?;
-    if let Err(e) = fs::remove_dir_all(cache_dir) {
-        // Attempt to restore on failure
-        let _ = fs::rename(&temp_dir, &source_path);
-        return Err(format!("Failed to clean cache directory: {e}"));
-    }
-    fs::rename(&temp_dir, cache_dir)
-        .map_err(|e| format!("Failed to finalize cache directory: {e}"))
-}
-
-/// Fetch templates from a parsed source URL into the cache directory.
-fn fetch_templates(cache_dir: &Path, source: &TemplateSource) -> Result<(), String> {
-    let parent = cache_dir.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("Failed to create parent directory: {e}"))?;
-    match source {
-        TemplateSource::Tree { repo_url, branch, sub_path } => {
-            fetch_from_tree(cache_dir, repo_url, branch, sub_path)
-        }
-        TemplateSource::Releases { .. } | TemplateSource::Repo { .. } => {
-            fetch_from_repo(cache_dir, "", source)
-        }
-    }
-}
-
-/// Clone a git repo at a specific branch, optionally promoting a subdirectory.
-fn fetch_from_tree(cache_dir: &Path, repo_url: &str, branch: &str, sub_path: &str) -> Result<(), String> {
-    eprintln!("[templates] Cloning {repo_url} (branch: {branch})...");
-    if cache_dir.is_dir() {
-        fs::remove_dir_all(cache_dir)
-            .map_err(|e| format!("Failed to remove template cache: {e}"))?;
-    }
-    let clone_ok = configured_command("git")
-        .args(["clone", "--quiet", "--depth", "1", "--branch", branch, repo_url, cache_dir.to_str().unwrap_or("")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !clone_ok {
-        return Err(format!("Failed to clone branch '{branch}' from {repo_url}"));
-    }
-    if !sub_path.is_empty() {
-        promote_subdirectory(cache_dir, sub_path)?;
-    }
-    eprintln!("[templates] Tree source ready at {}", cache_dir.display());
-    Ok(())
-}
-
-/// Clone the entire repository, optionally checking out the latest release tag.
-fn fetch_from_repo(cache_dir: &Path, _repo_url_arg: &str, source: &TemplateSource) -> Result<(), String> {
-    let repo_url = source.repo_url().unwrap_or_default();
-    eprintln!("[templates] Cloning repository {}...", repo_url);
-    if cache_dir.is_dir() {
-        fs::remove_dir_all(cache_dir)
-            .map_err(|e| format!("Failed to remove template cache: {e}"))?;
-    }
-    // Determine git URL and optional tag
-    let (git_url, checkout_tag) = match source {
-        TemplateSource::Releases { .. } => {
-            // For Releases type: clone without --branch first, then fetch + checkout tag
-            let api_url = source.releases_info().and_then(|(api, _)| {
-                latest_template_release_tag(&api).map(|tag| (api, tag))
-            }).map(|(api, _)| api);
-            match api_url {
-                Some(api) => {
-                    let tag = latest_template_release_tag(&api).unwrap_or_default();
-                    (Some(repo_url.clone()), if tag.is_empty() { None } else { Some(tag) })
-                }
-                None => (Some(repo_url.clone()), None),
-            }
-        }
-        TemplateSource::Repo { .. } => (Some(repo_url.clone()), None),
-        _ => return Err("Invalid source type for fetch_from_repo".to_string()),
-    };
-    let url = git_url.as_ref().map(|s| s.as_str()).unwrap_or("");
-    if url.is_empty() {
-        return Err("Repository URL is empty".to_string());
-    }
-    let clone_ok = configured_command("git")
-        .args(["clone", "--quiet", url, cache_dir.to_str().unwrap_or("")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !clone_ok {
-        return Err(format!("Failed to clone template repository: {url}"));
-    }
-    // Checkout the latest release tag if available
-    if let Some(ref tag) = checkout_tag {
-        eprintln!("[templates] Checking out release tag: {tag}");
-        let _ = configured_command("git")
-            .args(["fetch", "origin", "--quiet", "--tags"])
-            .current_dir(cache_dir)
-            .output();
-        let _ = configured_command("git")
-            .args(["checkout", tag, "--quiet"])
-            .current_dir(cache_dir)
-            .output();
-    }
-    eprintln!("[templates] Repository cloned to {}", cache_dir.display());
-    Ok(())
-}
-
-/// Resolve the effective template URL: user override takes precedence over the default.
-fn resolve_template_url(user_url: &str) -> String {
-    let user_url = user_url.trim();
-    if !user_url.is_empty() {
-        return user_url.to_string();
-    }
-    load_runtime_requirements(DEFAULT_RUNTIME_REQUIREMENTS)
-        .map(|r| r.sources.template_repo_url)
-        .unwrap_or_else(|_| "https://github.com/agentseek-ai/agentseek-templates/releases".to_string())
-}
-
-/// Delete the template cache and re-fetch templates from the configured URL.
-fn update_template_cache(template_url: &str) -> Result<(), String> {
-    let cache_dir = template_cache_dir()
-        .ok_or_else(|| "HOME environment variable is not set".to_string())?;
-    let url = resolve_template_url(template_url);
-    let source = parse_template_source_url(&url)?;
-    fetch_templates(&cache_dir, &source)
-}
-
-/// Ensure the template cache exists. Called lazily when listing templates.
-fn ensure_template_cache(template_url: &str) {
-    let Some(cache_dir) = template_cache_dir() else {
-        return;
-    };
-    if cache_dir.is_dir() {
-        return;
-    }
-    let url = resolve_template_url(template_url);
-    if let Ok(source) = parse_template_source_url(&url) {
-        let _ = fetch_templates(&cache_dir, &source);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Unit tests
+// CLI status & system info commands
 // ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn cli_status(check_latest: Option<bool>) -> Result<CliStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || current_cli_status(check_latest.unwrap_or(true)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn system_info(state: State<'_, DesktopState>) -> SystemInfo {
+    let (program, prefix) = cli_parts();
+    let config = state
+        .storage_config
+        .lock()
+        .ok()
+        .map(|config| config.clone())
+        .unwrap_or_default();
+    let effective_mode = state
+        .effective_storage_mode
+        .lock()
+        .map(|mode| mode.clone())
+        .unwrap_or_else(|_| "sqlite_embedded".to_string());
+    let (data_path, storage) = match effective_mode.as_str() {
+        "seekdb_embedded" => (config.path, "Embedded SeekDB".to_string()),
+        "seekdb_server" | "oceanbase_server" => (
+            format!("{}:{} / {}", config.host, config.port, config.database),
+            "SeekDB / OceanBase Server".to_string(),
+        ),
+        _ => (
+            sqlite_database_path(&state.data_dir, &config)
+                .to_string_lossy()
+                .to_string(),
+            "Embedded SQLite".to_string(),
+        ),
+    };
+    let docker_status = check_docker();
+    SystemInfo {
+        app_name: "AgentSeek Desktop".to_string(),
+        version: env!("APP_VERSION").to_string(),
+        data_path,
+        cli_strategy: std::iter::once(program)
+            .chain(prefix)
+            .collect::<Vec<_>>()
+            .join(" "),
+        storage: format!("{storage} (desktop state only; isolated from template instances)"),
+        docker_available: docker_status.cli_available,
+        docker_compose_available: docker_status.compose_v2_available,
+        docker_running: docker_status.daemon_running,
+    }
+}
 
 #[cfg(test)]
-mod template_url_tests {
+mod tests_cli {
     use super::*;
 
     #[test]
-    fn parse_tree_url_with_subpath() {
-        let result = parse_template_source_url("https://github.com/agentseek-ai/agentseek-templates/tree/main/templates");
-        assert_eq!(result.unwrap(), TemplateSource::Tree {
-            repo_url: "https://github.com/agentseek-ai/agentseek-templates".to_string(),
-            branch: "main".to_string(),
-            sub_path: "templates".to_string(),
-        });
+    fn dependency_versions_are_compared_across_command_formats() {
+        assert!(version_at_least("uv 0.7.11", &[0, 7, 0]));
+        assert!(version_at_least("v20.19.0", &[20, 19, 0]));
+        assert!(version_at_least("git version 2.30.0", &[2, 30, 0]));
+        assert!(!version_at_least("9.9.0", &[10, 0, 0]));
+        assert!(!version_at_least("not installed", &[1, 0, 0]));
     }
-
     #[test]
-    fn parse_tree_url_without_subpath() {
-        let result = parse_template_source_url("https://github.com/org/repo/tree/develop");
-        assert_eq!(result.unwrap(), TemplateSource::Tree {
-            repo_url: "https://github.com/org/repo".to_string(),
-            branch: "develop".to_string(),
-            sub_path: String::new(),
-        });
+    fn only_secret_environment_keys_are_redacted() {
+        assert!(is_secret_env_key("OPENAI_API_KEY"));
+        assert!(is_secret_env_key("DATABASE_PASSWORD"));
+        assert!(!is_secret_env_key("FRONTEND_PORT"));
+        assert!(!is_secret_env_key("COPILOTKIT_PORT"));
     }
-
     #[test]
-    fn parse_tree_url_with_nested_subpath() {
-        let result = parse_template_source_url("https://github.com/org/repo/tree/main/path/to/templates");
-        assert_eq!(result.unwrap(), TemplateSource::Tree {
-            repo_url: "https://github.com/org/repo".to_string(),
-            branch: "main".to_string(),
-            sub_path: "path/to/templates".to_string(),
-        });
+    fn agentseek_version_is_read_from_uv_tool_list() {
+        let output = "agentseek v0.0.4\n- agentseek\n";
+        assert_eq!(
+            parse_uv_tool_version(output, "agentseek").as_deref(),
+            Some("agentseek 0.0.4")
+        );
     }
-
     #[test]
-    fn parse_plain_repo_url() {
-        let result = parse_template_source_url("https://github.com/agentseek-ai/agentseek-templates");
-        assert_eq!(result.unwrap(), TemplateSource::Repo {
-            repo_url: "https://github.com/agentseek-ai/agentseek-templates".to_string(),
-        });
+    fn agentseek_version_is_read_after_banner() {
+        let output = "    _                    _\n   / \\   __ _  ___ _ __\nAGENTSEEK v0.0.4\n";
+        assert_eq!(
+            parse_agentseek_version(output).as_deref(),
+            Some("AGENTSEEK v0.0.4")
+        );
     }
-
     #[test]
-    fn parse_git_ssh_url() {
-        let result = parse_template_source_url("git@github.com:org/repo.git");
-        assert_eq!(result.unwrap(), TemplateSource::Repo {
-            repo_url: "git@github.com:org/repo.git".to_string(),
-        });
+    fn agentseek_latest_version_is_read_from_package_metadata() {
+        assert_eq!(
+            parse_agentseek_package_version(br#"{"info":{"version":"0.0.5"}}"#)
+                .expect("parse package version"),
+            "0.0.5"
+        );
     }
-
     #[test]
-    fn parse_empty_url_fails() {
-        assert!(parse_template_source_url("").is_err());
-        assert!(parse_template_source_url("   ").is_err());
+    fn numeric_version_empty_string_returns_empty_vec() {
+        assert!(numeric_version("").is_empty());
     }
-
     #[test]
-    fn parse_invalid_url_fails() {
-        assert!(parse_template_source_url("ftp://example.com/repo").is_err());
-        assert!(parse_template_source_url("not-a-url").is_err());
+    fn numeric_version_non_numeric_returns_empty_vec() {
+        assert!(numeric_version("abc").is_empty());
+        assert!(numeric_version("no version here").is_empty());
     }
-
     #[test]
-    fn parse_url_with_whitespace_is_trimmed() {
-        let result = parse_template_source_url("  https://github.com/org/repo  ");
-        assert_eq!(result.unwrap(), TemplateSource::Repo {
-            repo_url: "https://github.com/org/repo".to_string(),
-        });
+    fn numeric_version_pre_release_suffix_stops_at_suffix() {
+        let v = numeric_version("1.2.3-alpha");
+        assert_eq!(v, vec![1, 2, 3]);
     }
-
     #[test]
-    fn github_releases_api_from_https() {
-        let api = github_releases_api("https://github.com/org/repo");
-        assert_eq!(api.unwrap(), "https://api.github.com/repos/org/repo/releases/latest");
+    fn version_at_least_empty_version_returns_false() {
+        assert!(!version_at_least("", &[1, 0]));
     }
-
     #[test]
-    fn github_releases_api_from_https_with_git_suffix() {
-        let api = github_releases_api("https://github.com/org/repo.git");
-        assert_eq!(api.unwrap(), "https://api.github.com/repos/org/repo/releases/latest");
+    fn meets_requirement_empty_version_returns_false() {
+        assert!(!meets_requirement("", "1.0.0"));
     }
-
     #[test]
-    fn github_releases_api_from_ssh() {
-        let api = github_releases_api("git@github.com:org/repo.git");
-        assert_eq!(api.unwrap(), "https://api.github.com/repos/org/repo/releases/latest");
+    fn meets_requirement_non_numeric_returns_false() {
+        assert!(!meets_requirement("abc", "1.0.0"));
     }
-
     #[test]
-    fn github_releases_api_from_non_github() {
-        assert!(github_releases_api("https://gitlab.com/org/repo").is_none());
-    }
-
-    #[test]
-    fn template_source_releases_info() {
-        let tree = TemplateSource::Tree {
-            repo_url: "https://github.com/org/repo".to_string(),
-            branch: "main".to_string(),
-            sub_path: "templates".to_string(),
-        };
-        let (api_url, repo_url) = tree.releases_info().unwrap();
-        assert_eq!(api_url, "https://api.github.com/repos/org/repo/releases/latest");
-        assert_eq!(repo_url, "https://github.com/org/repo");
-        
-        let releases = TemplateSource::Releases {
-            repo_url: "https://github.com/other/repo".to_string(),
-        };
-        let (api_url, repo_url) = releases.releases_info().unwrap();
-        assert_eq!(api_url, "https://api.github.com/repos/other/repo/releases/latest");
-        assert_eq!(repo_url, "https://github.com/other/repo");
-    }
-
-    #[test]
-    fn resolve_template_url_prefers_user_override() {
-        assert_eq!(resolve_template_url("https://custom.example.com/templates"), "https://custom.example.com/templates");
-    }
-
-    #[test]
-    fn resolve_template_url_trims_whitespace() {
-        assert_eq!(resolve_template_url("  https://custom.example.com/templates  "), "https://custom.example.com/templates");
+    fn meets_requirement_pre_release_version() {
+        // "1.2.3-alpha" should parse to [1, 2, 3] and meet "1.2.0"
+        assert!(meets_requirement("1.2.3-alpha", "1.2.0"));
+        // But should NOT meet "1.3.0"
+        assert!(!meets_requirement("1.2.3-alpha", "1.3.0"));
     }
 }

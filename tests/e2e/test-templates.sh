@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# E2E conversation tests for all 11 AgentSeek templates.
+# E2E conversation tests for every template auto-discovered from the
+# AgentSeek template catalog (templates/index.json in the template cache).
+# New templates in the catalog run automatically — no script changes needed.
 #
 # For each template this script:
 #   1. Creates an instance via `agentseek create --no-input`
@@ -35,9 +37,11 @@
 # Optional (templates are skipped if the corresponding secret is missing):
 #   TAVILY_API_KEY        — deepagents/research (Tavily search, free tier available)
 #
-# Auto-skipped in CI (no public alternative exists):
-#   langchain/agentic-rag-openvino  — needs local OpenVINO model files
-#   langchain/cli-remote            — needs an external LangGraph server URL
+# Notes:
+#   langchain/agentic-rag-openvino — runs in CI (model download is supported,
+#                                     needs ~4GB free disk)
+#   langchain/cli-remote           — requires an external LangGraph server URL
+#                                     (no public alternative, may fail)
 #
 # Optional flags:
 #   E2E_TIMEOUT           — Per-template timeout in seconds (default: 300)
@@ -207,22 +211,52 @@ declare -a FAILED=()
 declare -a SKIPPED=()
 
 # ---------------------------------------------------------------------------
-# Template definitions
+# Template discovery
 #
-# Format: "template_id|type|graph_id|needs_docker|extra_env|ci_only_skip"
+# The template list is auto-discovered from the AgentSeek template catalog
+# (templates/index.json inside the template cache, the same registry that
+# `agentseek create --list-templates` uses), so new templates run without
+# touching this script.
 #
-# type:           "bub" (AG-UI gateway) or "langgraph" (LangGraph API)
-# graph_id:       LangGraph graph key (empty for bub type)
-# needs_docker:   1 if Docker is required, 0 otherwise
-# extra_env:      Extra required env vars (comma-separated, empty if none)
-# ci_only_skip:   Non-empty reason string if template should be skipped in CI
-#                 (needs local hardware, external service, etc.)
-# ---------------------------------------------------------------------------
+# Discovered per template id:
+#   tpl_type      — test protocol; inferred as "langgraph" by default, only
+#                   "bub" entries are listed below (the catalog cannot tell
+#                   which protocol a template is tested with)
+#   graph_id      — first graph key from langgraph.json (LangGraph protocol)
+#   needs_docker  — "1" when the template has a docker-compose.yml
+#
+# TEMPLATE_OVERRIDES overrides the inferred values per template id. Non-empty
+# fields replace the auto-discovered ones; add a line only for templates with
+# special requirements (bub protocol, extra secrets, Docker, CI skips,
+# task exports).
+#
 #   Field format: tpl_id|tpl_type|graph_id|needs_docker|extra_env|ci_only_skip|tpl_exports
 #   tpl_exports: comma-separated KEY=VALUE pairs exported when running tasks
-TEMPLATES=(
+TEMPLATE_OVERRIDES=(
+  "bub/default|bub|||||"
+  "deepagents/default|bub|||||"
+  "deepagents/research|langgraph|research|0|TAVILY_API_KEY||"
+  "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY||"
+  "deepagents/content-builder|langgraph|content_builder|0|||"
+  "langchain/default|bub||1|||"
+  "langchain/agentic-rag|||1|||"
+  "langchain/agentic-rag-hybrid|||1|||"
+  "langchain/agentic-rag-openvino|||1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
+  # graph_id is a cookiecutter variable ({{ cookiecutter.assistant_id }});
+  # pin it to the rendered value.
+  "langchain/cli-remote|langgraph|agent|0|||"
+)
+
+TEMPLATE_CACHE_DIR="${HOME}/.cookiecutters/agentseek"
+TEMPLATE_INDEX="${TEMPLATE_CACHE_DIR}/templates/index.json"
+# Repository used to seed the cache when the catalog is missing.
+TEMPLATE_REPO="${E2E_TEMPLATE_REPO:-https://github.com/agentseek-ai/agentseek-templates.git}"
+
+# Fallback list used when the catalog cannot be fetched (e.g. offline).
+FALLBACK_TEMPLATES=(
   "bub/default|bub||0|||"
   "deepagents/default|bub||0|||"
+  "deepagents/mcp|langgraph|mcp|0|||"
   "deepagents/research|langgraph|research|0|TAVILY_API_KEY||"
   "deepagents/sandbox|langgraph|sandbox|0|DAYTONA_API_KEY||"
   "deepagents/content-builder|langgraph|content_builder|0|||"
@@ -233,6 +267,110 @@ TEMPLATES=(
   "langchain/agentic-rag-openvino|langgraph|rag|1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
   "langchain/markdown-messages|langgraph|agent|0|||"
 )
+
+# Filled by discover_templates() before the test loop runs.
+TEMPLATES=()
+
+# Clone the template repository into the cache if the catalog is missing.
+ensure_template_cache() {
+  if [[ -f "$TEMPLATE_INDEX" ]]; then return 0; fi
+  if ! has_command git; then
+    log_warn "git not found — cannot fetch the template catalog"
+    return 1
+  fi
+  log_info "Template catalog missing — cloning $TEMPLATE_REPO ..."
+  # Clone to a temp dir first, then atomically swap it in, so a failed clone
+  # never leaves a partial cache behind (the cache is shared with the desktop app).
+  local tmp_dir="${TEMPLATE_CACHE_DIR}.tmp.$$"
+  if ! git clone --depth 1 "$TEMPLATE_REPO" "$tmp_dir" 2>/dev/null; then
+    log_warn "Failed to clone template repository"
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if [[ -e "$TEMPLATE_CACHE_DIR" ]]; then
+    mv "$TEMPLATE_CACHE_DIR" "${TEMPLATE_CACHE_DIR}.old.$$"
+    if ! mv "$tmp_dir" "$TEMPLATE_CACHE_DIR"; then
+      mv "${TEMPLATE_CACHE_DIR}.old.$$" "$TEMPLATE_CACHE_DIR"
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    rm -rf "${TEMPLATE_CACHE_DIR}.old.$$"
+  else
+    mv "$tmp_dir" "$TEMPLATE_CACHE_DIR"
+  fi
+  [[ -f "$TEMPLATE_INDEX" ]]
+}
+
+# Auto-discover templates from templates/index.json and merge overrides.
+# Falls back to FALLBACK_TEMPLATES when the catalog cannot be fetched.
+discover_templates() {
+  ensure_template_cache || {
+    TEMPLATES=("${FALLBACK_TEMPLATES[@]}")
+    log_warn "Using built-in fallback list (${#TEMPLATES[@]} templates)"
+    return 1
+  }
+  local raw
+  raw=$(python3 - "$TEMPLATE_INDEX" "$TEMPLATE_CACHE_DIR/templates" <<'PY'
+import json, os, sys
+
+index_path, root = sys.argv[1], sys.argv[2]
+with open(index_path, encoding="utf-8") as f:
+    index = json.load(f)
+
+
+def find_file(tdir, name):
+    # Cookiecutter templates keep the real files under the project_slug dir.
+    for base in (tdir, os.path.join(tdir, "{{cookiecutter.project_slug}}")):
+        path = os.path.join(base, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+for tpl_id in sorted(index):
+    tdir = os.path.join(root, tpl_id)
+    ttype, graph_id = "langgraph", ""
+    langgraph_json = find_file(tdir, "langgraph.json")
+    if langgraph_json:
+        try:
+            with open(langgraph_json, encoding="utf-8") as f:
+                graphs = json.load(f).get("graphs", {})
+            if graphs:
+                graph_id = next(iter(graphs))
+        except (OSError, ValueError):
+            pass
+    needs_docker = "1" if find_file(tdir, "docker-compose.yml") else "0"
+    print(f"{tpl_id}|{ttype}|{graph_id}|{needs_docker}|||")
+PY
+  )
+  if [[ -z "$raw" ]]; then
+    TEMPLATES=("${FALLBACK_TEMPLATES[@]}")
+    log_warn "Template catalog was empty — using built-in fallback list"
+    return 1
+  fi
+  local discovered=()
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local id="${line%%|*}"
+    local merged="$line"
+    local entry
+    for entry in "${TEMPLATE_OVERRIDES[@]}"; do
+      local o_id o_type o_graph o_docker o_env o_skip o_exports
+      IFS='|' read -r o_id o_type o_graph o_docker o_env o_skip o_exports <<< "$entry"
+      [[ "$o_id" != "$id" ]] && continue
+      local a_graph a_docker a_env a_skip a_exports
+      IFS='|' read -r _ o_type_auto a_graph a_docker a_env a_skip a_exports <<< "$line"
+      # Non-empty override fields replace the auto-discovered values.
+      merged="${id}|${o_type:-$o_type_auto}|${o_graph:-$a_graph}|${o_docker:-$a_docker}|${o_env:-$a_env}|${o_skip:-$a_skip}|${o_exports:-$a_exports}"
+      break
+    done
+    discovered+=("$merged")
+  done <<< "$raw"
+  TEMPLATES=("${discovered[@]}")
+  log_info "Auto-discovered ${#TEMPLATES[@]} templates from templates/index.json"
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -902,6 +1040,28 @@ main() {
   echo ""
 
   mkdir -p "$E2E_WORK_DIR"
+
+  # Auto-discover templates from the template catalog; falls back to the
+  # built-in list when the catalog cannot be fetched.
+  discover_templates || true
+
+  # E2E_DRY_RUN=1 prints the resolved test matrix and exits without running.
+  if [[ "${E2E_DRY_RUN:-0}" == "1" ]]; then
+    echo "Discovered template test matrix:"
+    local entry
+    for entry in "${TEMPLATES[@]}"; do
+      local tpl_id tpl_type graph_id needs_docker extra_env ci_only_skip tpl_exports
+      IFS='|' read -r tpl_id tpl_type graph_id needs_docker extra_env ci_only_skip tpl_exports <<< "$entry"
+      local extras=""
+      [[ -n "$extra_env" ]] && extras="${extras}, extra_env=$extra_env"
+      [[ -n "$tpl_exports" ]] && extras="${extras}, exports=$tpl_exports"
+      echo "  $tpl_id  [type=$tpl_type, graph=$graph_id, docker=$needs_docker${extras}]"
+    done
+    echo ""
+    echo "Total: ${#TEMPLATES[@]} templates"
+    stop_mock_api
+    exit 0
+  fi
 
   # If arguments are provided, only test those templates.
   local templates_to_test=()

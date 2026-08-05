@@ -57,16 +57,22 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Resolve template repo HEAD
+        # Content-aware cache key: cache hits only when the remote template
+        # repository is unchanged; a new commit automatically refreshes it.
+        id: templates
+        run: echo "sha=$(git ls-remote https://github.com/agentseek-ai/agentseek-templates.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+
       - name: Cache agentseek templates
         uses: actions/cache@v5
         with:
           path: ~/.cookiecutters/agentseek
-          key: agentseek-templates-${{ hashFiles('src-tauri/Cargo.lock') }}
+          key: agentseek-templates-${{ steps.templates.outputs.sha }}
 
       - name: Fetch agentseek templates
         run: |
           if [ ! -d ~/.cookiecutters/agentseek/templates ]; then
-            git clone --depth 1 https://github.com/ob-labs/agentseek.git ~/.cookiecutters/agentseek
+            git clone --depth 1 https://github.com/agentseek-ai/agentseek-templates.git ~/.cookiecutters/agentseek
           fi
 
       - name: Run frontend tests
