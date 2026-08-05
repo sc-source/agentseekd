@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # E2E conversation tests for every template auto-discovered from the
-# AgentSeek template catalog (templates/index.json in the template cache).
+# AgentSeek template catalog via `agentseek create --list-templates`
+# (explicit-catalog mode, same commit used for creation).
 # New templates in the catalog run automatically — no script changes needed.
 #
 # For each template this script:
@@ -44,12 +45,16 @@
 #                                     (no public alternative, may fail)
 #
 # Optional flags:
-#   E2E_TIMEOUT           — Per-template timeout in seconds (default: 300)
-#   E2E_WORK_DIR          — Working directory (default: /tmp/agentseek-e2e)
-#   SKIP_DOCKER_TEMPLATES — Set to 1 to skip templates requiring Docker
-#   SKIP_CI_ONLY          — Set to 1 to skip templates that need local
-#                           hardware/external services (openvino, cli-remote)
-#   MOCK_API_PORT         — Port for mock API server (default: 8899)
+#   E2E_TIMEOUT            — Per-template timeout in seconds (default: 300)
+#   E2E_WORK_DIR           — Working directory (default: /tmp/agentseek-e2e)
+#   SKIP_DOCKER_TEMPLATES  — Set to 1 to skip templates requiring Docker
+#   SKIP_CI_ONLY           — Set to 1 to skip templates that need local
+#                            hardware/external services (openvino, cli-remote)
+#   MOCK_API_PORT          — Port for mock API server (default: 8899)
+#   E2E_TEMPLATE_REPO      — Template catalog repository (default: official)
+#   E2E_TEMPLATE_CHECKOUT  — Pin the catalog commit (default: remote main HEAD)
+#   E2E_TEMPLATE_PROXY     — Proxy used ONLY for catalog fetch (create/list);
+#                            service traffic during dev never goes through it
 
 set -euo pipefail
 
@@ -214,9 +219,9 @@ declare -a SKIPPED=()
 # Template discovery
 #
 # The template list is auto-discovered from the AgentSeek template catalog
-# (templates/index.json inside the template cache, the same registry that
-# `agentseek create --list-templates` uses), so new templates run without
-# touching this script.
+# through `agentseek create --list-templates` (explicit-catalog mode), so the
+# test matrix always matches what creation supports, and new templates run
+# without touching this script.
 #
 # Discovered per template id:
 #   tpl_type      — test protocol; inferred as "langgraph" by default, only
@@ -245,12 +250,18 @@ TEMPLATE_OVERRIDES=(
   # graph_id is a cookiecutter variable ({{ cookiecutter.assistant_id }});
   # pin it to the rendered value.
   "langchain/cli-remote|langgraph|agent|0|||"
+  # AG-UI gateway served via docker compose (no LangGraph protocol).
+  "langchain/relay-observability|bub||1|||"
 )
 
-TEMPLATE_CACHE_DIR="${HOME}/.cookiecutters/agentseek"
-TEMPLATE_INDEX="${TEMPLATE_CACHE_DIR}/templates/index.json"
-# Repository used to seed the cache when the catalog is missing.
+# Templates are resolved through the agentseek CLI's explicit-catalog mode
+# (--template-repo/--checkout), so the test matrix and `agentseek create`
+# always use the same catalog commit — no local clone is needed.
 TEMPLATE_REPO="${E2E_TEMPLATE_REPO:-https://github.com/agentseek-ai/agentseek-templates.git}"
+TEMPLATE_CHECKOUT="${E2E_TEMPLATE_CHECKOUT:-}"
+# Optional proxy applied ONLY to catalog fetching; dev/service traffic must
+# stay direct, so it is not exported globally.
+TEMPLATE_PROXY="${E2E_TEMPLATE_PROXY:-}"
 
 # Fallback list used when the catalog cannot be fetched (e.g. offline).
 FALLBACK_TEMPLATES=(
@@ -266,109 +277,78 @@ FALLBACK_TEMPLATES=(
   "langchain/agentic-rag-hybrid|langgraph|hybrid-rag|1|||"
   "langchain/agentic-rag-openvino|langgraph|rag|1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
   "langchain/markdown-messages|langgraph|agent|0|||"
+  "langchain/relay-observability|bub||1|||"
 )
 
 # Filled by discover_templates() before the test loop runs.
 TEMPLATES=()
 
-# Clone the template repository into the cache if the catalog is missing.
-ensure_template_cache() {
-  if [[ -f "$TEMPLATE_INDEX" ]]; then return 0; fi
+# Resolve the catalog commit the CLI should fetch (remote main HEAD unless
+# pinned via E2E_TEMPLATE_CHECKOUT).
+resolve_template_checkout() {
+  if [[ -n "$TEMPLATE_CHECKOUT" ]]; then
+    log_info "Using pinned template checkout ${TEMPLATE_CHECKOUT:0:12}"
+    return 0
+  fi
   if ! has_command git; then
-    log_warn "git not found — cannot fetch the template catalog"
+    log_warn "git not found — cannot resolve the template repo HEAD"
     return 1
   fi
-  log_info "Template catalog missing — cloning $TEMPLATE_REPO ..."
-  # Clone to a temp dir first, then atomically swap it in, so a failed clone
-  # never leaves a partial cache behind (the cache is shared with the desktop app).
-  local tmp_dir="${TEMPLATE_CACHE_DIR}.tmp.$$"
-  if ! git clone --depth 1 "$TEMPLATE_REPO" "$tmp_dir" 2>/dev/null; then
-    log_warn "Failed to clone template repository"
-    rm -rf "$tmp_dir"
+  TEMPLATE_CHECKOUT=$(git ls-remote "$TEMPLATE_REPO" refs/heads/main 2>/dev/null | cut -f1)
+  if [[ -z "$TEMPLATE_CHECKOUT" ]]; then
+    log_warn "Could not resolve template repo HEAD for $TEMPLATE_REPO"
     return 1
   fi
-  if [[ -e "$TEMPLATE_CACHE_DIR" ]]; then
-    mv "$TEMPLATE_CACHE_DIR" "${TEMPLATE_CACHE_DIR}.old.$$"
-    if ! mv "$tmp_dir" "$TEMPLATE_CACHE_DIR"; then
-      mv "${TEMPLATE_CACHE_DIR}.old.$$" "$TEMPLATE_CACHE_DIR"
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-    rm -rf "${TEMPLATE_CACHE_DIR}.old.$$"
-  else
-    mv "$tmp_dir" "$TEMPLATE_CACHE_DIR"
-  fi
-  [[ -f "$TEMPLATE_INDEX" ]]
+  log_info "Template catalog checkout: ${TEMPLATE_CHECKOUT:0:12}"
 }
 
-# Auto-discover templates from templates/index.json and merge overrides.
+# Auto-discover templates through the agentseek CLI's explicit-catalog mode,
+# so the test matrix always matches what `agentseek create` can build.
+# Metadata (protocol, graph id, Docker) comes from TEMPLATE_OVERRIDES and
+# FALLBACK_TEMPLATES, since the catalog is no longer cloned locally.
 # Falls back to FALLBACK_TEMPLATES when the catalog cannot be fetched.
 discover_templates() {
-  ensure_template_cache || {
+  resolve_template_checkout || {
     TEMPLATES=("${FALLBACK_TEMPLATES[@]}")
     log_warn "Using built-in fallback list (${#TEMPLATES[@]} templates)"
     return 1
   }
-  local raw
-  raw=$(python3 - "$TEMPLATE_INDEX" "$TEMPLATE_CACHE_DIR/templates" <<'PY'
-import json, os, sys
-
-index_path, root = sys.argv[1], sys.argv[2]
-with open(index_path, encoding="utf-8") as f:
-    index = json.load(f)
-
-
-def find_file(tdir, name):
-    # Cookiecutter templates keep the real files under the project_slug dir.
-    for base in (tdir, os.path.join(tdir, "{{cookiecutter.project_slug}}")):
-        path = os.path.join(base, name)
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-for tpl_id in sorted(index):
-    tdir = os.path.join(root, tpl_id)
-    ttype, graph_id = "langgraph", ""
-    langgraph_json = find_file(tdir, "langgraph.json")
-    if langgraph_json:
-        try:
-            with open(langgraph_json, encoding="utf-8") as f:
-                graphs = json.load(f).get("graphs", {})
-            if graphs:
-                graph_id = next(iter(graphs))
-        except (OSError, ValueError):
-            pass
-    needs_docker = "1" if find_file(tdir, "docker-compose.yml") else "0"
-    print(f"{tpl_id}|{ttype}|{graph_id}|{needs_docker}|||")
-PY
-  )
-  if [[ -z "$raw" ]]; then
+  local ids
+  local proxy_env=()
+  if [[ -n "$TEMPLATE_PROXY" ]]; then
+    proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
+  fi
+  ids=$(env "${proxy_env[@]}" agentseek create --list-templates \
+    --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>/dev/null \
+    | grep -oE '^[[:space:]]{2,}[a-z0-9._-]+/[a-z0-9._-]+' | tr -d ' ')
+  if [[ -z "$ids" ]]; then
     TEMPLATES=("${FALLBACK_TEMPLATES[@]}")
-    log_warn "Template catalog was empty — using built-in fallback list"
+    log_warn "agentseek --list-templates returned no templates — using built-in fallback list"
     return 1
   fi
   local discovered=()
-  local line
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    local id="${line%%|*}"
-    local merged="$line"
+  local id
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    # Fill each field from the first non-empty match in TEMPLATE_OVERRIDES,
+    # then FALLBACK_TEMPLATES (override fields take precedence).
+    local t_type="" t_graph="" t_docker="" t_env="" t_skip="" t_exports=""
     local entry
-    for entry in "${TEMPLATE_OVERRIDES[@]}"; do
-      local o_id o_type o_graph o_docker o_env o_skip o_exports
-      IFS='|' read -r o_id o_type o_graph o_docker o_env o_skip o_exports <<< "$entry"
-      [[ "$o_id" != "$id" ]] && continue
-      local a_graph a_docker a_env a_skip a_exports
-      IFS='|' read -r _ o_type_auto a_graph a_docker a_env a_skip a_exports <<< "$line"
-      # Non-empty override fields replace the auto-discovered values.
-      merged="${id}|${o_type:-$o_type_auto}|${o_graph:-$a_graph}|${o_docker:-$a_docker}|${o_env:-$a_env}|${o_skip:-$a_skip}|${o_exports:-$a_exports}"
-      break
+    for entry in "${TEMPLATE_OVERRIDES[@]}" "${FALLBACK_TEMPLATES[@]}"; do
+      local m_id m_type m_graph m_docker m_env m_skip m_exports
+      IFS='|' read -r m_id m_type m_graph m_docker m_env m_skip m_exports <<< "$entry"
+      [[ "$m_id" == "$id" ]] || continue
+      [[ -z "$t_type" && -n "$m_type" ]] && t_type="$m_type"
+      [[ -z "$t_graph" && -n "$m_graph" ]] && t_graph="$m_graph"
+      [[ -z "$t_docker" && -n "$m_docker" ]] && t_docker="$m_docker"
+      [[ -z "$t_env" && -n "$m_env" ]] && t_env="$m_env"
+      [[ -z "$t_skip" && -n "$m_skip" ]] && t_skip="$m_skip"
+      [[ -z "$t_exports" && -n "$m_exports" ]] && t_exports="$m_exports"
     done
-    discovered+=("$merged")
-  done <<< "$raw"
+    discovered+=("${id}|${t_type:-langgraph}|${t_graph}|${t_docker:-0}|${t_env}|${t_skip}|${t_exports}")
+  done <<< "$ids"
   TEMPLATES=("${discovered[@]}")
-  log_info "Auto-discovered ${#TEMPLATES[@]} templates from templates/index.json"
+  log_info "Auto-discovered ${#TEMPLATES[@]} templates via agentseek --list-templates (checkout ${TEMPLATE_CHECKOUT:0:12})"
   return 0
 }
 
@@ -840,7 +820,14 @@ test_template() {
   # Record directories before creation to detect the new one.
   local before_dirs
   before_dirs=$(ls -d "$E2E_WORK_DIR"/*/ 2>/dev/null || true)
-  if ! agentseek create "$tpl_id" --no-input --output-dir "$E2E_WORK_DIR" 2>&1 | tail -5; then
+  # Only catalog fetching goes through the optional proxy; everything else
+  # (setup, dev, health checks) stays on the direct network.
+  local proxy_env=()
+  if [[ -n "$TEMPLATE_PROXY" ]]; then
+    proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
+  fi
+  if ! env "${proxy_env[@]}" agentseek create "$tpl_id" --no-input --output-dir "$E2E_WORK_DIR" \
+      --template-repo "$TEMPLATE_REPO" --checkout "$TEMPLATE_CHECKOUT" 2>&1 | tail -5; then
     log_fail "  Failed to create instance"
     FAILED+=("$tpl_id (create failed)")
     return 1
