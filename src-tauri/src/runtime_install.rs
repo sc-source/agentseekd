@@ -160,18 +160,19 @@ fn posix_runtime_install_script(
             format!("export NVM_DIR={}", shell_quote(&nvm_dir.to_string_lossy())),
             "export PROFILE=/dev/null".to_string(),
             "mkdir -p \"$NVM_DIR\"".to_string(),
+            // Force nvm install script to use Gitee mirror directly, avoiding
+            // unreliable GitHub proxies that may be unreachable.
+            format!("export NVM_SOURCE={}.git", shell_quote(NVM_INSTALL_MIRROR)),
             {
                 let nvm_gitee = format!(
                     "{}/raw/v{}/install.sh",
                     NVM_INSTALL_MIRROR,
                     &requirements.versions.nvm.managed
                 );
-                let nvm_proxy = format!("https://ghproxy.net/{}", nvm_installer);
                 format!(
-                    "if [ ! -s \"$NVM_DIR/nvm.sh\" ]; then run_shell_installer {primary} nvm || run_shell_installer {gitee} nvm || run_shell_installer {proxy} nvm; fi",
+                    "if [ ! -s \"$NVM_DIR/nvm.sh\" ]; then run_shell_installer {primary} nvm || run_shell_installer {gitee} nvm; fi",
                     primary = shell_quote(&nvm_installer),
                     gitee = shell_quote(&nvm_gitee),
-                    proxy = shell_quote(&nvm_proxy),
                 )
             },
             ". \"$NVM_DIR/nvm.sh\"".to_string(),

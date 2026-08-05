@@ -826,10 +826,9 @@ async fn prepare_instance(
         // Patch Dockerfile to fall back to mirrors.aliyun.com when the
         // official Debian apt sources are unreachable (common in China).
         patch_dockerfile_apt_mirror_if_needed(&target);
-        // Patch Dockerfile to add GitHub + PyPI mirror fallbacks for slow
-        // connections in China. Tests actual download speed from the
-        // pyproject.toml GitHub dependencies and falls back to ghfast.top /
-        // mirrors.aliyun.com when direct access is too slow.
+        // Patch Dockerfile to add PyPI mirror fallback for slow
+        // connections in China. Tests actual download speed from pypi.org
+        // and falls back to mirrors.aliyun.com when direct access is too slow.
         patch_dockerfile_mirrors_if_needed(&target);
         // Patch langgraph.json CORS to allow any origin (templates hardcode a
         // specific frontend port that doesn't match the dynamically assigned one).
@@ -1430,7 +1429,7 @@ mod tests_templates {
         if let Some(path) = dockerfile {
             let content = fs::read_to_string(&path).expect("read");
             // bub/default Dockerfile has no apt-get update or uv sync.
-            assert!(!content.contains("ghfast.top"));
+            assert!(!content.contains("mirrors.aliyun.com/pypi/simple/"));
         }
         // No langgraph.json or convert_models.py in this template.
         assert!(find_file_recursive(&dir, "langgraph.json", 5).is_none());
@@ -1446,7 +1445,7 @@ mod tests_templates {
         if let Some(path) = dockerfile {
             let content = fs::read_to_string(&path).expect("read");
             // deepagents/default Dockerfile has no apt-get update or uv sync.
-            assert!(!content.contains("ghfast.top"));
+            assert!(!content.contains("mirrors.aliyun.com/pypi/simple/"));
         }
         fs::remove_dir_all(&dir).ok();
     }
@@ -1494,7 +1493,6 @@ mod tests_templates {
         let content = fs::read_to_string(&dockerfile).expect("read");
         assert!(content.contains("timeout 60"), "apt mirror patch not applied");
         assert!(content.contains("mirrors.aliyun.com"), "apt mirror fallback missing");
-        assert!(content.contains("ghfast.top"), "GitHub mirror fallback missing");
         assert!(content.contains("mirrors.aliyun.com/pypi/simple/"), "PyPI mirror fallback missing");
         // Idempotency: applying again should not change anything.
         let before = content.clone();
@@ -1512,7 +1510,7 @@ mod tests_templates {
         if let Some(path) = dockerfile {
             let content = fs::read_to_string(&path).expect("read");
             // cli-remote Dockerfile has no apt-get update or uv sync.
-            assert!(!content.contains("ghfast.top"));
+            assert!(!content.contains("mirrors.aliyun.com/pypi/simple/"));
         }
         // Has langgraph.json but no cors section.
         if let Some(path) = find_file_recursive(&dir, "langgraph.json", 5) {

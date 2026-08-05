@@ -207,8 +207,9 @@ fn dependency_commands(
     let managed_nvm = PathBuf::from(&managed_root).join("nvm");
     let managed_node_command = match platform {
         "macos" | "debian" | "rhel" | "linux" => format!(
-            "unset npm_config_prefix && export NVM_DIR=\"{}\" PROFILE=/dev/null && curl -o- {} | bash && . \"{}/nvm.sh\" && nvm install {} && node --version && npm --version",
+            "unset npm_config_prefix && export NVM_DIR=\"{}\" PROFILE=/dev/null NVM_SOURCE={}.git && curl -o- {} | bash && . \"{}/nvm.sh\" && nvm install {} && node --version && npm --version",
             managed_nvm.to_string_lossy(),
+            NVM_INSTALL_MIRROR,
             nvm_installer,
             managed_nvm.to_string_lossy(),
             node_major,

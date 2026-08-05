@@ -250,15 +250,11 @@ fn patch_dockerfile_apt_mirror_if_needed(instance_dir: &Path) {
     let _ = fs::write(&path, patched);
 }
 
-/// Patch Dockerfile to add GitHub and PyPI mirror fallbacks for slow
+/// Patch Dockerfile to add PyPI mirror fallback for slow
 /// connections in China.
 ///
-/// Two independent checks:
-/// 1. **GitHub mirror** – read `pyproject.toml`, find the first GitHub repo,
-///    download 500 KB of its tarball, must finish in 3 s (≈167 KB/s).  If too
-///    slow, route all GitHub URLs through `ghfast.top` proxy.
-/// 2. **PyPI mirror** – download 200 KB from pypi.org, must finish in 3 s
-///    (≈67 KB/s).  If too slow, fall back to `mirrors.aliyun.com/pypi/simple/`.
+/// **PyPI mirror** – download 200 KB from pypi.org, must finish in 3 s
+/// (≈67 KB/s).  If too slow, fall back to `mirrors.aliyun.com/pypi/simple/`.
 fn patch_dockerfile_mirrors_if_needed(instance_dir: &Path) {
     let Some(path) = find_file_recursive(instance_dir, "Dockerfile", 5) else {
         return;
@@ -266,12 +262,11 @@ fn patch_dockerfile_mirrors_if_needed(instance_dir: &Path) {
     let Ok(content) = fs::read_to_string(&path) else {
         return;
     };
-    // Skip if already patched (ghfast.top is the definitive marker) or no uv
-    // sync command.
-    if content.contains("ghfast.top") || !content.contains("uv sync") {
+    // Skip if already patched or no uv sync command.
+    if content.contains("mirrors.aliyun.com/pypi/simple/") || !content.contains("uv sync") {
         return;
     }
-    // Replace the UV index variable handling block with: GitHub mirror test +
+    // Replace the UV index variable handling block with:
     // PyPI speed test + Aliyun mirror fallback.
     //
     // Templates use this pattern:
@@ -297,9 +292,7 @@ fn patch_dockerfile_mirrors_if_needed(instance_dir: &Path) {
     }
 
     let new_block = format!(
-        r#"timeout 15 python -c "import urllib.request,time,sys; c=open('pyproject.toml').read(); i=c.find('github.com/'); sys.exit(0) if i<0 else None; r=c[i+11:].split('\"')[0]; r=r[:-4] if r.endswith('.git') else r; s=time.time(); urllib.request.urlopen(f'https://github.com/{{r}}/archive/HEAD.tar.gz',timeout=10).read(500000); sys.exit(1 if time.time()-s>3 else 0)" >/dev/null 2>&1 || \
-        git config --global url."https://ghfast.top/https://github.com/".insteadOf "https://github.com/"; \
-    if [ -n "${{UV_DEFAULT_INDEX:-}}" ]; then export UV_DEFAULT_INDEX; \
+        r#"if [ -n "${{UV_DEFAULT_INDEX:-}}" ]; then export UV_DEFAULT_INDEX; \
     elif [ -n "${{UV_INDEX_URL:-}}" ]; then export UV_INDEX_URL; \
     elif ! timeout 15 python -c "import urllib.request,time; start=time.time(); resp=urllib.request.urlopen('https://pypi.org/simple/pip/',timeout=5); resp.read(200000); assert time.time()-start<=3" >/dev/null 2>&1; then \
         export UV_INDEX_URL={pypi_mirror}; \
@@ -1983,15 +1976,13 @@ mod tests_instance {
         .join("\n")
     }
     #[test]
-    fn mirrors_patch_adds_github_and_pypi_fallback() {
+    fn mirrors_patch_adds_pypi_fallback() {
         let dir = patch_test_dir("mirrors-normal");
         let dockerfile = dir.join("Dockerfile");
         fs::write(&dockerfile, sample_dockerfile_with_uv()).expect("write");
         patch_dockerfile_mirrors_if_needed(&dir);
         let patched = fs::read_to_string(&dockerfile).expect("read");
-        assert!(patched.contains("ghfast.top"));
         assert!(patched.contains("mirrors.aliyun.com/pypi/simple/"));
-        assert!(patched.contains("pyproject.toml"));
         // Original fi; lines should be replaced with elif chain.
         assert!(patched.contains("elif [ -n \"${UV_INDEX_URL"));
         fs::remove_dir_all(&dir).ok();
