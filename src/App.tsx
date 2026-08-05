@@ -844,7 +844,7 @@ export default function App() {
       const deleted = !instanceStatus && latestEntry?.level === "success" && latestMessage.includes("deleted");
       return {
         id,
-        instanceName: latestEntry?.instanceName || "AgentSeek",
+        instanceName: latestEntry?.instanceName || "AgentSeek Desktop",
         instanceStatus,
         entries: orderedEntries,
         latestAt: Math.max(...entries.map((entry) => entry.createdAt)),

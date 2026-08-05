@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/sign-and-notarize.sh \
-#     --dmg ~/Downloads/AgentSeek.dmg \
+#     --dmg ~/Downloads/AgentSeek_Desktop.dmg \
 #     --output ~/Desktop/signed.dmg \
 #     [--tag v0.0.1-rc.1]
 #
@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-APP_NAME="AgentSeek"
+APP_NAME="AgentSeek Desktop"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BG_IMAGE=""
@@ -395,7 +395,7 @@ EOF
 
     echo "" >&2
     yellow "══════════════════════════════════════════════════" >&2
-    yellow "  AgentSeek macOS Sign + Notarize" >&2
+    yellow "  AgentSeek Desktop macOS Sign + Notarize" >&2
     yellow "══════════════════════════════════════════════════" >&2
     echo "" >&2
     green "  Input:  $dmg_file" >&2

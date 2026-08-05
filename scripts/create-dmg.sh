@@ -40,7 +40,7 @@ tell application "Finder"
         set arrangement of viewOptions to not arranged
         set icon size of viewOptions to 128
         set background picture of viewOptions to file ".background:dmg-background.png"
-        set position of item "AgentSeek" of container window to {180, 190}
+        set position of item "$VOLNAME" of container window to {180, 190}
         set position of item "Applications" of container window to {480, 190}
         close
         open

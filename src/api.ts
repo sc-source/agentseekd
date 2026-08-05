@@ -145,7 +145,7 @@ function mockLog(store: MockStore, instance: InstanceRecord | null, category: Lo
   store.logs.unshift({
     id: `log-${Date.now()}-${store.logs.length}`,
     instanceId: instance?.id,
-    instanceName: instance?.name ?? "AgentSeek",
+    instanceName: instance?.name ?? "AgentSeek Desktop",
     category,
     level,
     message,

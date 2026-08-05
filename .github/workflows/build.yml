@@ -156,7 +156,7 @@ jobs:
             x86_64-apple-darwin)  ARCH=x64 ;;
             *)                    ARCH=universal ;;
           esac
-          OUTPUT="$DMG_DIR/${APP_NAME}_${VERSION}_${ARCH}.dmg"
+          OUTPUT="$DMG_DIR/${APP_NAME// /_}_${VERSION}_${ARCH}.dmg"
           BG="src-tauri/resources/dmg-background.png"
 
           bash scripts/create-dmg.sh "$APP" "$OUTPUT" "$BG"
@@ -216,6 +216,13 @@ jobs:
               ;;
           esac
 
+          # Normalize product names with spaces (e.g. "AgentSeek Desktop")
+          # to underscores on every platform so artifact paths never contain
+          # spaces and all bundles follow the AgentSeek_Desktop_* convention.
+          for f in "$ARTIFACT_DIR"/*; do
+            [ -e "$f" ] && mv "$f" "${f// /_}" 2>/dev/null || true
+          done
+
           if [ -z "$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -print -quit)" ]; then
             echo "No bundle files were collected for $RUNNER_OS" >&2
             for root in "${BUNDLE_ROOTS[@]}"; do
@@ -234,7 +241,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: agentseek-${{ matrix.label }}
           path: ci-artifacts/${{ matrix.label }}
