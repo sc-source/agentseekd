@@ -250,8 +250,9 @@ TEMPLATE_OVERRIDES=(
   # graph_id is a cookiecutter variable ({{ cookiecutter.assistant_id }});
   # pin it to the rendered value.
   "langchain/cli-remote|langgraph|agent|0|||"
-  # AG-UI gateway served via docker compose (no LangGraph protocol).
-  "langchain/relay-observability|bub||1|||"
+  # AG-UI gateway served via docker compose (no LangGraph protocol);
+  # TAVILY_API_KEY is declared required in its lifecycle.toml doctor.
+  "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
 )
 
 # Templates are resolved through the agentseek CLI's explicit-catalog mode
@@ -277,7 +278,7 @@ FALLBACK_TEMPLATES=(
   "langchain/agentic-rag-hybrid|langgraph|hybrid-rag|1|||"
   "langchain/agentic-rag-openvino|langgraph|rag|1|||UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu,UV_INDEX_STRATEGY=unsafe-best-match"
   "langchain/markdown-messages|langgraph|agent|0|||"
-  "langchain/relay-observability|bub||1|||"
+  "langchain/relay-observability|bub||1|TAVILY_API_KEY||"
 )
 
 # Filled by discover_templates() before the test loop runs.
@@ -294,7 +295,13 @@ resolve_template_checkout() {
     log_warn "git not found — cannot resolve the template repo HEAD"
     return 1
   fi
-  TEMPLATE_CHECKOUT=$(git ls-remote "$TEMPLATE_REPO" refs/heads/main 2>/dev/null | cut -f1)
+  # HEAD resolution fetches the same catalog the create step will fetch,
+  # so route it through the optional proxy too.
+  local proxy_env=()
+  if [[ -n "$TEMPLATE_PROXY" ]]; then
+    proxy_env=(ALL_PROXY="$TEMPLATE_PROXY" HTTPS_PROXY="$TEMPLATE_PROXY" HTTP_PROXY="$TEMPLATE_PROXY")
+  fi
+  TEMPLATE_CHECKOUT=$(env "${proxy_env[@]}" git ls-remote "$TEMPLATE_REPO" refs/heads/main 2>/dev/null | cut -f1)
   if [[ -z "$TEMPLATE_CHECKOUT" ]]; then
     log_warn "Could not resolve template repo HEAD for $TEMPLATE_REPO"
     return 1
@@ -461,6 +468,17 @@ check_prerequisites() {
 # Configure .env for a template instance.
 # Copies .env.example to .env if it does not exist, then appends API keys.
 # Usage: configure_env <instance_dir> <template_type> <extra_env_vars> <needs_docker>
+# Address used by containers to reach services on the host: the Docker
+# bridge gateway on Linux CI runners, host.docker.internal on macOS Docker
+# Desktop (where 172.17.0.1 does not exist).
+docker_host_gateway() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "host.docker.internal"
+  else
+    echo "172.17.0.1"
+  fi
+}
+
 configure_env() {
   local dir="$1"
   local tpl_type="$2"
@@ -499,12 +517,11 @@ configure_env() {
   agentseek_base=$(resolve_api_base AGENTSEEK_API_BASE)
   agentseek_model=$(resolve_model AGENTSEEK_MODEL)
 
-  # For Docker-based templates, replace 127.0.0.1 with the Docker bridge gateway
-  # so containers can reach the Mock API Server on the host.
-  # 172.17.0.1 is the default Docker bridge gateway on Linux.
+  # For Docker-based templates, replace 127.0.0.1 with the host gateway
+  # address so containers can reach the Mock API Server on the host.
   local _host="127.0.0.1"
   if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
-    _host="172.17.0.1"
+    _host=$(docker_host_gateway)
   fi
 
   [[ -n "$bub_key" ]]       && echo "BUB_API_KEY=$bub_key" >> "$env_file"
@@ -516,6 +533,10 @@ configure_env() {
 
   [[ -n "$agentseek_key" ]]   && echo "AGENTSEEK_API_KEY=$agentseek_key" >> "$env_file"
   [[ -n "$agentseek_base" ]]  && echo "AGENTSEEK_API_BASE=$(echo "$agentseek_base" | sed "s/127\.0\.0\.1/$_host/")" >> "$env_file"
+  # Newer templates (e.g. deepagents/mcp) declare AGENTSEEK_MODEL_API_KEY as
+  # required in lifecycle.toml; agentseek dev runs a strict doctor pass and
+  # aborts startup without it, so write the same key under this alias too.
+  [[ -n "$agentseek_key" ]]   && echo "AGENTSEEK_MODEL_API_KEY=$agentseek_key" >> "$env_file"
   [[ -n "$agentseek_model" ]] && echo "AGENTSEEK_MODEL=$agentseek_model" >> "$env_file"
   # LangChain init_chat_model accepts OPENAI_MODEL as alias.
   [[ -n "$agentseek_model" ]] && echo "OPENAI_MODEL=$agentseek_model" >> "$env_file"
@@ -874,7 +895,9 @@ test_template() {
   # `agentseek task --list` shows available tasks; each task is run by name.
   # Critical tasks (sync, frontend, models, seekdb) must succeed.
   # Non-critical tasks (ingest-sample, seekdb-skills) only produce a warning.
-  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills"
+  # relay-export only verifies events from a previous dev session; a fresh
+  # instance has no archive yet, and the real check is the conversation test.
+  local NON_CRITICAL_TASKS="ingest-sample|seekdb-skills|relay-export"
   log_info "  Installing dependencies..."
   local setup_log="${instance_dir}/.e2e-setup.log"
   local task_list
@@ -932,9 +955,9 @@ test_template() {
   local _openai_key _openai_base
   _openai_key=$(resolve_api_key OPENAI_API_KEY)
   _openai_base=$(resolve_api_base OPENAI_API_BASE)
-  # For Docker templates, use Docker bridge gateway so containers can reach the mock server.
+  # For Docker templates, use the host gateway address so containers can reach the mock server.
   if [[ "$needs_docker" == "1" ]] && _is_mock_mode; then
-    _openai_base=$(echo "$_openai_base" | sed 's/127\.0\.0\.1/172.17.0.1/')
+    _openai_base=$(echo "$_openai_base" | sed "s/127\.0\.0\.1/$(docker_host_gateway)/")
   fi
   (cd "$instance_dir" && \
     OPENAI_API_KEY="$_openai_key" \
