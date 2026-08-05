@@ -13,7 +13,19 @@ rm -f "$RW" "$OUTPUT" 2>/dev/null || true
 hdiutil detach "/Volumes/$VOLNAME" -force 2>/dev/null || true
 
 hdiutil create -ov -volname "$VOLNAME" -fs HFS+ -size 200m "$RW" >/dev/null 2>&1
-hdiutil attach "$RW" -nobrowse >/dev/null 2>&1
+
+# Attach can transiently fail on shared CI runners; retry a few times.
+for _ in 1 2 3; do
+    if hdiutil attach "$RW" -nobrowse >/dev/null 2>&1; then
+        break
+    fi
+    hdiutil detach "/Volumes/$VOLNAME" -force 2>/dev/null || true
+    sleep 3
+done
+hdiutil info 2>/dev/null | grep -q "/Volumes/$VOLNAME" || {
+    echo "Failed to attach $RW after 3 attempts" >&2
+    exit 1
+}
 
 # Use ditto to preserve extended attributes / resource forks
 ditto "$APP" "/Volumes/$VOLNAME/$(basename "$APP")"

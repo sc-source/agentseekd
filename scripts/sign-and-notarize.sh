@@ -93,22 +93,44 @@ extract_app() {
         sleep 1
     fi
 
-    # Mount the DMG (use default mount point, more reliable than -mountpoint)
+    # Mount the DMG (use default mount point, more reliable than -mountpoint).
+    # hdiutil attach can transiently fail on shared CI runners (output stops
+    # at "Checksumming..." with no mount point), so retry a few times and
+    # fall back to `hdiutil info` when the attach output is truncated.
     cyan "  Mounting..."
-    local attach_output
-    attach_output="$(hdiutil attach "$dmg_real" -nobrowse -readonly 2>&1)" || {
-        red " Failed to mount DMG"
-        red "  Output: $attach_output"
-        exit 1
-    }
-    echo "$attach_output" 2>&1 | sed 's/^/  /' >&2
-
-    # Extract mount point from attach output (last line, last column)
-    local mount_point
-    mount_point="$(echo "$attach_output" | tail -1 | awk '{print $NF}')"
-    if [ -z "$mount_point" ] || [ ! -d "$mount_point" ]; then
-        red " Could not determine mount point"
+    local attach_output=""
+    local mount_point=""
+    local attempt
+    for attempt in 1 2 3; do
+        attach_output="$(hdiutil attach "$dmg_real" -nobrowse -readonly 2>&1)" || {
+            red " Failed to mount DMG (attempt $attempt/3)"
+            red "  Output: $attach_output"
+            hdiutil detach "$dmg_real" -force 2>/dev/null || true
+            sleep 3
+            continue
+        }
+        # Extract mount point from attach output (last line, last column),
+        # falling back to hdiutil info when the output is truncated.
+        mount_point="$(echo "$attach_output" | tail -1 | awk '{print $NF}')"
+        if [ -z "$mount_point" ] || [ ! -d "$mount_point" ]; then
+            mount_point="$(hdiutil info 2>/dev/null \
+                | awk -v dmg="$dmg_real" '
+                    /image-path/ { path=$3 }
+                    /mount-point/ { mp=$3 }
+                    END { if (path == dmg) print mp }
+                ')"
+        fi
+        if [ -n "$mount_point" ] && [ -d "$mount_point" ]; then
+            break
+        fi
+        red " Could not determine mount point (attempt $attempt/3)"
         red "  attach output: $attach_output"
+        hdiutil detach "$dmg_real" -force 2>/dev/null || true
+        sleep 3
+        mount_point=""
+    done
+    if [ -z "$mount_point" ]; then
+        red " Failed to mount DMG after 3 attempts"
         exit 1
     fi
     green "  ✓ Mounted at: $mount_point"
