@@ -79,12 +79,14 @@ extract_app() {
     dmg_real="$(cd "$(dirname "$dmg")" && pwd)/$(basename "$dmg")"
     cyan "  DMG path: $dmg_real"
 
-    # Eject any previously mounted instance of this DMG (prevents hang)
+    # Eject any previously mounted instance of this DMG (prevents hang).
+    # NOTE: mount points can contain spaces ("AgentSeek Desktop"), so paths
+    # are extracted from `hdiutil info` lines via regex, never via awk fields.
     local existing_mount=""
     existing_mount="$(hdiutil info 2>/dev/null \
         | awk -v dmg="$dmg_real" '
-            /image-path/ { path=$3 }
-            /mount-point/ { mp=$3 }
+            /image-path/  { path=$0; sub(/^.*image-path:[[:space:]]*/, "", path) }
+            /mount-point/ { mp=$0;  sub(/^.*mount-point:[[:space:]]*/, "", mp) }
             END { if (path == dmg) print mp }
         ')"
     if [ -n "$existing_mount" ] && [ -d "$existing_mount" ]; then
@@ -109,14 +111,18 @@ extract_app() {
             sleep 3
             continue
         }
-        # Extract mount point from attach output (last line, last column),
-        # falling back to hdiutil info when the output is truncated.
-        mount_point="$(echo "$attach_output" | tail -1 | awk '{print $NF}')"
+        # Extract mount point from attach output (last non-empty line, minus
+        # the device and filesystem columns), falling back to hdiutil info
+        # when the output is truncated. Keep spaces in the mount point.
+        mount_point="$(echo "$attach_output" \
+            | grep -v '^[[:space:]]*$' \
+            | tail -1 \
+            | sed -E 's/^([^[:space:]]+[[:space:]]+){2}//')"
         if [ -z "$mount_point" ] || [ ! -d "$mount_point" ]; then
             mount_point="$(hdiutil info 2>/dev/null \
                 | awk -v dmg="$dmg_real" '
-                    /image-path/ { path=$3 }
-                    /mount-point/ { mp=$3 }
+                    /image-path/  { path=$0; sub(/^.*image-path:[[:space:]]*/, "", path) }
+                    /mount-point/ { mp=$0;  sub(/^.*mount-point:[[:space:]]*/, "", mp) }
                     END { if (path == dmg) print mp }
                 ')"
         fi
@@ -125,7 +131,7 @@ extract_app() {
         fi
         red " Could not determine mount point (attempt $attempt/3)"
         red "  attach output: $attach_output"
-        hdiutil detach "$dmg_real" -force 2>/dev/null || true
+        hdiutil detach "${mount_point:-$dmg_real}" -force 2>/dev/null || true
         sleep 3
         mount_point=""
     done
