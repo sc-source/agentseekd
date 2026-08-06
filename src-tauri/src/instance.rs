@@ -365,6 +365,10 @@ fn recheck_instance_ports(
     // Treat ports reserved by other instances as conflicts even when their
     // processes are stopped; the instance itself owns nothing yet pre-deploy.
     let changes = resolve_port_conflicts_inner(&mut entries, &reserved, &HashSet::new())?;
+    // Restore corrupted container-internal endpoints to their loopback
+    // template defaults first, then the lifecycle sync below aligns their
+    // ports with the resolved values (e.g. 127.0.0.1:6006 -> 127.0.0.1:56438).
+    restore_non_loopback_url_defaults(&instance.work_dir, &mut entries);
     sync_env_urls_from_lifecycle(&instance.work_dir, &mut entries);
     if !changes.is_empty() || entries.iter().any(|e| e.modified) {
         fs::write(&env_path, render_env(&entries)).map_err(|error| error.to_string())?;

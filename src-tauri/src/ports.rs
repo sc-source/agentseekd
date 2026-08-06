@@ -148,7 +148,47 @@ fn resolve_port_conflicts_inner(
     Ok(changes)
 }
 
+/// Replace every `{host}:{old_port}` occurrence in a value with
+/// `{host}:{new_port}`, skipping occurrences where the port continues into
+/// more digits (e.g. 6006 must never corrupt 60060 or 60061) or where the
+/// host is itself a suffix of a longer host.
+fn replace_host_port(value: &str, host: &str, old_port: u16, new_port: u16) -> String {
+    let needle = format!("{host}:{old_port}");
+    let replacement = format!("{host}:{new_port}");
+    let mut result = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(index) = rest.find(&needle) {
+        let before_ok = rest[..index]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_ascii_alphanumeric() && c != '.' && c != '-')
+            .unwrap_or(true);
+        let after = &rest[index + needle.len()..];
+        let after_ok = !after
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+        if !before_ok || !after_ok {
+            result.push_str(&rest[..index + needle.len()]);
+            rest = after;
+            continue;
+        }
+        result.push_str(&rest[..index]);
+        result.push_str(&replacement);
+        rest = after;
+    }
+    result.push_str(rest);
+    result
+}
+
 /// Rewrite `*_URL` and `*_ENDPOINT` values that embed any changed port (old → new).
+///
+/// Only host-reachable (loopback) values are rewritten: container-internal
+/// endpoints (e.g. RELAY_PHOENIX_ENDPOINT=http://phoenix:6006/v1/traces)
+/// reference the in-network port and must keep it even when the host-facing
+/// port differs. Port occurrences are replaced with numeric boundary checks
+/// so that e.g. 6006 never corrupts 60060 or 60061.
 fn rebase_url_ports(entries: &mut [EnvVariable], changes: &[PortChange]) {
     for change in changes {
         let key_prefix = change.key.trim_end_matches("_PORT");
@@ -157,24 +197,25 @@ fn rebase_url_ports(entries: &mut [EnvVariable], changes: &[PortChange]) {
             .filter(|candidate| candidate.old_port == change.old_port)
             .count()
             > 1;
-        // Process *_URL entries (existing behavior).
+        // Process loopback *_URL entries (existing behavior).
         for entry in entries.iter_mut().filter(|entry| {
             let key = entry.key.to_ascii_uppercase();
-            key.contains("URL") && (!duplicate_old_port || key.contains(key_prefix))
+            key.contains("URL")
+                && (!duplicate_old_port || key.contains(key_prefix))
+                && LOOPBACK_URL_PREFIXES
+                    .iter()
+                    .any(|prefix| entry.value.starts_with(prefix))
         }) {
             let mut updated = entry.value.clone();
             for host in ["127.0.0.1", "localhost", "0.0.0.0", "[::1]"] {
-                updated = updated.replace(
-                    &format!("{host}:{}", change.old_port),
-                    &format!("{host}:{}", change.new_port),
-                );
+                updated = replace_host_port(&updated, host, change.old_port, change.new_port);
             }
             if updated != entry.value {
                 entry.value = updated;
                 entry.modified = true;
             }
         }
-        // Process *_ENDPOINT entries (e.g. OTLP traces endpoint).
+        // Process loopback *_ENDPOINT entries (e.g. OTLP traces endpoint).
         // When PHOENIX_PORT changes, update localhost endpoints that
         // reference the old port so OTLP export stays aligned.
         for entry in entries.iter_mut().filter(|entry| {
@@ -182,13 +223,13 @@ fn rebase_url_ports(entries: &mut [EnvVariable], changes: &[PortChange]) {
             key.contains("ENDPOINT")
                 && !key.contains("URL")
                 && key_prefix == "PHOENIX"
+                && LOCALHOST_URL_PREFIXES
+                    .iter()
+                    .any(|prefix| entry.value.starts_with(prefix))
         }) {
             let mut updated = entry.value.clone();
             for host in ["127.0.0.1", "localhost"] {
-                updated = updated.replace(
-                    &format!("{host}:{}", change.old_port),
-                    &format!("{host}:{}", change.new_port),
-                );
+                updated = replace_host_port(&updated, host, change.old_port, change.new_port);
             }
             if updated != entry.value {
                 entry.value = updated;
@@ -531,5 +572,78 @@ BUB_AG_UI_AGENT_URL=http://127.0.0.1:57975/agent\n",
             .expect("bind listener");
         let port = listener.local_addr().expect("read port").port();
         assert!(!port_is_available(port));
+    }
+    #[test]
+    fn replace_host_port_respects_numeric_boundaries() {
+        // 6006 must never corrupt 60060/60061 or hosts ending in the needle.
+        assert_eq!(
+            replace_host_port("http://127.0.0.1:60060/api", "127.0.0.1", 6006, 60663),
+            "http://127.0.0.1:60060/api"
+        );
+        assert_eq!(
+            replace_host_port("http://127.0.0.1:6006/api", "127.0.0.1", 6006, 60663),
+            "http://127.0.0.1:60663/api"
+        );
+        assert_eq!(
+            replace_host_port("http://localhost:60061/ctx", "localhost", 6006, 60663),
+            "http://localhost:60061/ctx"
+        );
+        assert_eq!(
+            replace_host_port("http://localhost:6006", "localhost", 6006, 60663),
+            "http://localhost:60663"
+        );
+        // Multiple occurrences are all rebased.
+        assert_eq!(
+            replace_host_port(
+                "http://127.0.0.1:6006/api http://127.0.0.1:6006/health",
+                "127.0.0.1",
+                6006,
+                60663
+            ),
+            "http://127.0.0.1:60663/api http://127.0.0.1:60663/health"
+        );
+    }
+    #[test]
+    fn rebase_url_ports_keeps_container_internal_endpoints_untouched() {
+        // Relay-style instance: PHOENIX_PORT conflicts, but the container-
+        // internal OTLP endpoint (http://phoenix:...) must keep its port while
+        // the host-reachable loopback URL follows the resolved port.
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind occupied port");
+        let occupied_port = occupied.local_addr().expect("read occupied port").port();
+        let mut entries = vec![
+            EnvVariable {
+                key: "PHOENIX_PORT".to_string(),
+                value: occupied_port.to_string(),
+                ..EnvVariable::default()
+            },
+            EnvVariable {
+                key: "RELAY_PHOENIX_ENDPOINT".to_string(),
+                value: format!("http://phoenix:{occupied_port}/v1/traces"),
+                ..EnvVariable::default()
+            },
+            EnvVariable {
+                key: "PHOENIX_URL".to_string(),
+                value: format!("http://127.0.0.1:{occupied_port}"),
+                ..EnvVariable::default()
+            },
+        ];
+        let changes = resolve_port_conflicts(&mut entries).expect("resolve port conflict");
+        assert_eq!(changes.len(), 1);
+        let endpoint = entries
+            .iter()
+            .find(|e| e.key == "RELAY_PHOENIX_ENDPOINT")
+            .expect("endpoint entry");
+        assert_eq!(
+            endpoint.value,
+            format!("http://phoenix:{occupied_port}/v1/traces"),
+            "container-internal endpoint must keep its in-network port"
+        );
+        assert!(!endpoint.modified);
+        let url = entries
+            .iter()
+            .find(|e| e.key == "PHOENIX_URL")
+            .expect("url entry");
+        assert_eq!(url.value, format!("http://127.0.0.1:{}", changes[0].new_port));
+        assert!(url.modified, "loopback URL must follow the resolved port");
     }
 }

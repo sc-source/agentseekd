@@ -232,7 +232,31 @@ fn merge_env_entries(source: &[EnvVariable], vault: &[EnvVariable]) -> Vec<EnvVa
                 // by other instances must not override this instance's resolved
                 // ports (e.g. a stale LANGGRAPH_PORT from an old instance would
                 // otherwise break a freshly scaffolded one).
-                if !is_local_service_port_key(&entry.key) && !saved.value.trim().is_empty() {
+                //
+                // URL/ENDPOINT values pointing at container-internal hosts
+                // (e.g. http://phoenix:6006/v1/traces) are instance-specific
+                // too: the template default is host-reachable (loopback) and a
+                // stale vault value saved by another instance must not override
+                // it for local-process instances. Remote hosts with a domain
+                // name (user-customized collectors) still merge normally.
+                let template_is_loopback = LOOPBACK_URL_PREFIXES
+                    .iter()
+                    .any(|prefix| entry.value.starts_with(prefix));
+                let vault_is_container_host = (entry
+                    .key
+                    .to_ascii_uppercase()
+                    .contains("URL")
+                    || entry.key.to_ascii_uppercase().contains("ENDPOINT"))
+                    && !LOOPBACK_URL_PREFIXES
+                        .iter()
+                        .any(|prefix| saved.value.starts_with(prefix))
+                    && url_host(&saved.value)
+                        .map(|host| !host.contains('.'))
+                        .unwrap_or(false);
+                if !is_local_service_port_key(&entry.key)
+                    && !saved.value.trim().is_empty()
+                    && !(template_is_loopback && vault_is_container_host)
+                {
                     entry.value = saved.value.clone();
                     entry.source = "vault".to_string();
                 }
@@ -426,6 +450,88 @@ fn sync_endpoint_ports_by_changes(entries: &mut [EnvVariable], changes: &[PortCh
                     entry.modified = true;
                 }
             }
+        }
+    }
+}
+
+/// Extract the host portion of a URL value, without the port.
+fn url_host(url: &str) -> Option<&str> {
+    let remainder = url.split("://").nth(1)?;
+    let authority = remainder.split(['/', '?', '#']).next()?;
+    if authority.starts_with('[') {
+        authority.split_once(']').map(|(host, _)| host)
+    } else {
+        authority
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .or(Some(authority))
+    }
+}
+
+/// Restore non-loopback `*_URL`/`*_ENDPOINT` entries whose port drifted from
+/// the template default in `.env.example`.
+///
+/// Container-internal endpoints (e.g. RELAY_PHOENIX_ENDPOINT) reference the
+/// in-network port (phoenix:6006) and are never rewritten by port conflict
+/// resolution, so a port mismatch with the example value means the value was
+/// corrupted by an older buggy rewrite; align the port back to the default.
+/// Entries whose host differs from the example (user-customized remote
+/// endpoints) are left untouched.
+fn restore_non_loopback_url_defaults(work_dir: &str, entries: &mut [EnvVariable]) {
+    let example_path = Path::new(work_dir).join(".env.example");
+    let Ok(example_content) = fs::read_to_string(&example_path) else {
+        return;
+    };
+    let examples = parse_env(&example_content);
+    for entry in entries.iter_mut() {
+        let normalized_key = entry.key.to_ascii_uppercase();
+        if !normalized_key.contains("URL") && !normalized_key.contains("ENDPOINT") {
+            continue;
+        }
+        if LOOPBACK_URL_PREFIXES
+            .iter()
+            .any(|prefix| entry.value.starts_with(prefix))
+        {
+            continue;
+        }
+        let Some(example) = examples
+            .iter()
+            .find(|e| e.key.eq_ignore_ascii_case(&entry.key))
+        else {
+            continue;
+        };
+        // The template default is host-reachable (loopback) but the current
+        // value references a container-internal host (e.g. phoenix:6006).
+        // For local-process instances that host does not resolve on the
+        // host machine, so the value was corrupted; restore the template
+        // default and let the later lifecycle sync align its port.
+        if LOOPBACK_URL_PREFIXES
+            .iter()
+            .any(|prefix| example.value.starts_with(prefix))
+            && !LOOPBACK_URL_PREFIXES
+                .iter()
+                .any(|prefix| entry.value.starts_with(prefix))
+        {
+            entry.value = example.value.clone();
+            entry.modified = true;
+            continue;
+        }
+        let (Some(current_port), Some(default_port)) = (
+            extract_url_port(&entry.value),
+            extract_url_port(&example.value),
+        ) else {
+            continue;
+        };
+        if current_port == default_port {
+            continue;
+        }
+        if url_host(&entry.value) != url_host(&example.value) {
+            continue;
+        }
+        let updated = replace_url_port(&entry.value, default_port);
+        if updated != entry.value {
+            entry.value = updated;
+            entry.modified = true;
         }
     }
 }
@@ -1111,5 +1217,176 @@ mod tests_env {
         );
         assert!(!endpoint.modified, "remote endpoint should not be modified");
         fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn restore_non_loopback_url_defaults_fixes_polluted_container_endpoints() {
+        // A container-internal endpoint corrupted by an older rewrite (e.g.
+        // phoenix:60663) must be restored to the .env.example default (6006),
+        // while already-correct non-loopback endpoints stay untouched.
+        let root = env::temp_dir().join(format!(
+            "agentseek-desktop-restore-defaults-{}",
+            unique_stamp()
+        ));
+        fs::create_dir_all(&root).expect("create root directory");
+        fs::write(
+            root.join(".env.example"),
+            "RELAY_PHOENIX_ENDPOINT=http://phoenix:6006/v1/traces\n\
+             OTEL_EXPORTER_ENDPOINT=https://collector.example.com:4318/v1/traces\n",
+        )
+        .expect("write example env");
+        let mut entries = parse_env(
+            "RELAY_PHOENIX_ENDPOINT=http://phoenix:60663/v1/traces\n\
+             OTEL_EXPORTER_ENDPOINT=https://collector.example.com:4318/v1/traces\n",
+        );
+        restore_non_loopback_url_defaults(&root.to_string_lossy(), &mut entries);
+        let endpoint = entries
+            .iter()
+            .find(|e| e.key == "RELAY_PHOENIX_ENDPOINT")
+            .expect("endpoint entry should exist");
+        assert_eq!(
+            endpoint.value, "http://phoenix:6006/v1/traces",
+            "polluted container-internal endpoint should be restored to the template default"
+        );
+        assert!(endpoint.modified, "restored endpoint should be marked as modified");
+        let remote = entries
+            .iter()
+            .find(|e| e.key == "OTEL_EXPORTER_ENDPOINT")
+            .expect("remote endpoint should exist");
+        assert_eq!(remote.value, "https://collector.example.com:4318/v1/traces");
+        assert!(!remote.modified, "matching remote endpoint must not be touched");
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn restore_non_loopback_url_defaults_keeps_customized_remote_hosts() {
+        // A user-pointed remote host (different from the example) must never
+        // be restored, even when the port happens to match the example.
+        let root = env::temp_dir().join(format!(
+            "agentseek-desktop-restore-custom-{}",
+            unique_stamp()
+        ));
+        fs::create_dir_all(&root).expect("create root directory");
+        fs::write(
+            root.join(".env.example"),
+            "OTEL_EXPORTER_ENDPOINT=https://collector.example.com:4318/v1/traces\n",
+        )
+        .expect("write example env");
+        let mut entries = parse_env(
+            "OTEL_EXPORTER_ENDPOINT=https://custom-collector.example.com:4318/v1/traces\n",
+        );
+        restore_non_loopback_url_defaults(&root.to_string_lossy(), &mut entries);
+        let remote = entries
+            .iter()
+            .find(|e| e.key == "OTEL_EXPORTER_ENDPOINT")
+            .expect("remote endpoint should exist");
+        assert_eq!(
+            remote.value, "https://custom-collector.example.com:4318/v1/traces",
+            "user-customized remote host must not be restored"
+        );
+        assert!(!remote.modified);
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn restore_non_loopback_url_defaults_leaves_loopback_entries_alone() {
+        // Loopback entries are owned by port conflict resolution; the restore
+        // pass must not revert resolved ports back to template defaults.
+        let root = env::temp_dir().join(format!(
+            "agentseek-desktop-restore-loopback-{}",
+            unique_stamp()
+        ));
+        fs::create_dir_all(&root).expect("create root directory");
+        fs::write(root.join(".env.example"), "PHOENIX_URL=http://127.0.0.1:6006\n")
+            .expect("write example env");
+        let mut entries = parse_env("PHOENIX_URL=http://127.0.0.1:63320\n");
+        restore_non_loopback_url_defaults(&root.to_string_lossy(), &mut entries);
+        let url = entries
+            .iter()
+            .find(|e| e.key == "PHOENIX_URL")
+            .expect("url entry should exist");
+        assert_eq!(url.value, "http://127.0.0.1:63320");
+        assert!(!url.modified, "loopback entries are handled by conflict resolution");
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn restore_non_loopback_url_defaults_restores_container_host_to_loopback_default() {
+        // A local-process instance whose OTLP endpoint was rewritten to the
+        // container host (http://phoenix:6006/v1/traces) while the template
+        // default is loopback must be restored to the template value; the
+        // later lifecycle sync aligns the port.
+        let root = env::temp_dir().join(format!(
+            "agentseek-desktop-restore-container-host-{}",
+            unique_stamp()
+        ));
+        fs::create_dir_all(&root).expect("create root directory");
+        fs::write(
+            root.join(".env.example"),
+            "AGENTSEEK_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:6006/v1/traces\n",
+        )
+        .expect("write example env");
+        let mut entries = parse_env(
+            "AGENTSEEK_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://phoenix:6006/v1/traces\n",
+        );
+        restore_non_loopback_url_defaults(&root.to_string_lossy(), &mut entries);
+        let endpoint = entries
+            .iter()
+            .find(|e| e.key == "AGENTSEEK_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .expect("endpoint entry should exist");
+        assert_eq!(
+            endpoint.value, "http://127.0.0.1:6006/v1/traces",
+            "container-host endpoint must be restored to the loopback template default"
+        );
+        assert!(endpoint.modified);
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+    #[test]
+    fn merge_env_entries_ignores_stale_container_host_vault_values() {
+        // Template default is loopback; the shared vault holds a stale
+        // container-internal value (http://phoenix:6006/v1/traces) saved by an
+        // older instance. The vault value must not override the template
+        // default for the freshly scaffolded instance.
+        let source = parse_env(
+            "AGENTSEEK_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:6006/v1/traces\n\
+             PHOENIX_PORT=56438\n\
+             AGENTSEEK_MODEL=openai:glm-4.5\n",
+        );
+        let vault = parse_env(
+            "AGENTSEEK_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://phoenix:6006/v1/traces\n\
+             AGENTSEEK_MODEL=openai:glm-5.2\n",
+        );
+        let merged = merge_env_entries(&source, &vault);
+        let endpoint = merged
+            .iter()
+            .find(|e| e.key == "AGENTSEEK_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+            .expect("endpoint entry should exist");
+        assert_eq!(
+            endpoint.value, "http://127.0.0.1:6006/v1/traces",
+            "stale container-host vault value must not override the loopback template default"
+        );
+        assert_ne!(endpoint.source, "vault");
+        // Non-URL vault values still merge normally.
+        let model = merged
+            .iter()
+            .find(|e| e.key == "AGENTSEEK_MODEL")
+            .expect("model entry should exist");
+        assert_eq!(model.value, "openai:glm-5.2");
+        assert_eq!(model.source, "vault");
+    }
+    #[test]
+    fn merge_env_entries_keeps_user_customized_remote_endpoints() {
+        // A remote collector host with a domain name is user-customized and
+        // must still merge over the loopback template default.
+        let source = parse_env("OTEL_EXPORTER_ENDPOINT=http://127.0.0.1:6006/v1/traces\n");
+        let vault = parse_env(
+            "OTEL_EXPORTER_ENDPOINT=https://collector.example.com:4318/v1/traces\n",
+        );
+        let merged = merge_env_entries(&source, &vault);
+        let endpoint = merged
+            .iter()
+            .find(|e| e.key == "OTEL_EXPORTER_ENDPOINT")
+            .expect("endpoint entry should exist");
+        assert_eq!(
+            endpoint.value, "https://collector.example.com:4318/v1/traces",
+            "user-customized remote endpoint must be kept"
+        );
+        assert_eq!(endpoint.source, "vault");
     }
 }
